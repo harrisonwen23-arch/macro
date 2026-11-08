@@ -67,6 +67,7 @@ struct WinTest {
 	int early = 0;
 	int late = 0;
 	int endFrame = 0x7fffffff;
+	int baseEnd = 0x7fffffff; // frame where the unshifted macro dies (INT_MAX = it finishes)
 	bool resolved = false;   // result of the current attempt already recorded
 	bool lastOk = false;
 	bool pendingReset = false;
@@ -594,7 +595,9 @@ static void wtBuildWork() {
 	std::stable_sort(g_work.begin(), g_work.end(), [](MacroInput const& a, MacroInput const& b) {
 		return a.frame < b.frame;
 	});
-	g_wt.endFrame = clickFrame + S("win-after");
+	// survive for a while after the click, but never past where the macro
+	// itself dies (that is the latest point we can judge)
+	g_wt.endFrame = std::min(clickFrame + S("win-after"), g_wt.baseEnd);
 }
 
 // 1 = keep testing, 0 = finished, -1 = macro does not finish on its own
@@ -602,6 +605,15 @@ static int wtAdvance() {
 	int maxS = S("win-max");
 	if (g_wt.phase == 0) {
 		if (!g_wt.lastOk) return -1;
+		// the macro doesn't have to finish the level: test only the clicks
+		// that happen before the frame where it dies
+		std::vector<int> keep;
+		for (int ci : g_wt.clicks) {
+			if (ci >= 0 && ci < static_cast<int>(g_inputs.size()) && g_inputs[ci].frame < g_wt.baseEnd) keep.push_back(ci);
+		}
+		g_wt.clicks = keep;
+		if (g_wt.clicks.empty()) return -1;
+		g_wt.ci = 0;
 		g_wt.phase = 1;
 		g_wt.s = 1;
 		g_wt.early = 0;
@@ -615,9 +627,11 @@ static int wtAdvance() {
 		g_wt.s = 1;
 		return 1;
 	}
-	if (g_wt.lastOk) g_wt.late = g_wt.s;
-	if (g_wt.lastOk && g_wt.s < maxS) { g_wt.s++; return 1; }
-	g_windows[g_wt.clicks[g_wt.ci]] = { g_wt.early, g_wt.late };
+	int clickIdx = g_wt.clicks[g_wt.ci];
+	bool lateOk = g_wt.lastOk && g_inputs[clickIdx].frame + g_wt.s < g_wt.baseEnd;
+	if (lateOk) g_wt.late = g_wt.s;
+	if (lateOk && g_wt.s < maxS) { g_wt.s++; return 1; }
+	g_windows[clickIdx] = { g_wt.early, g_wt.late };
 	g_wt.ci++;
 	if (g_wt.ci >= g_wt.clicks.size()) return 0;
 	g_wt.phase = 1;
@@ -634,11 +648,12 @@ static void wtFinish(bool aborted) {
 	g_wt.pendingAdvance = false;
 	if (aborted) {
 		g_windows.clear();
-		showSavedBox("Test stopped: macro doesn't finish the level on its own");
+		showSavedBox("Test stopped: no clicks to test before the macro's death");
 		return;
 	}
 	if (!g_selected.empty()) writeMacro(g_selected);
-	showSavedBox("Window test done and saved");
+	if (g_wt.baseEnd < 0x7fffffff) showSavedBox("Window test done (up to frame " + std::to_string(g_wt.baseEnd) + "), saved");
+	else showSavedBox("Window test done and saved");
 }
 
 // ---------- solver engine ----------
@@ -2223,7 +2238,9 @@ class $modify(GJBaseGameLayer) {
 			float ex = p->getPositionX() - x;
 			float ey = p->getPositionY() - y;
 			if (std::fabs(ex) > 0.5f || std::fabs(ey) > 0.5f) g_corrections++;
-			p->setPosition({ x, y });
+			// don't touch the position when it already matches: re-setting it
+			// every frame disturbs the wave trail, which is built from positions
+			if (std::fabs(ex) > 0.02f || std::fabs(ey) > 0.02f) p->setPosition({ x, y });
 			if (S("route-vel")) p->m_yVelocity = v;
 			return;
 		}
@@ -2347,7 +2364,13 @@ class $modify(PlayLayer) {
 		PlayLayer::destroyPlayer(player, object);
 		if (g_mode == 3 && g_wt.active && !g_wt.resolved) {
 			this->stopActionByTag(0x10); // cancel GD's slow delayed restart
-			wtResolve(false);
+			if (g_wt.phase == 0) {
+				// the macro dies here on its own: that is the latest point we can judge
+				g_wt.baseEnd = g_frame;
+				wtResolve(true);
+			} else {
+				wtResolve(false);
+			}
 		}
 		if (g_mode == 4 && g_sol.active && !g_sol.resolved) {
 			this->stopActionByTag(0x10);

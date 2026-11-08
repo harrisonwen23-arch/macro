@@ -76,18 +76,21 @@ static std::vector<MacroInput> g_work; // macro with the tested click shifted
 // far is replayed exactly (positions + clicks); past its end the solver tries
 // click patterns. A chunk that survives is kept, a chunk that dies tries the
 // next pattern, and when every pattern fails it backs up one chunk.
-struct SolFrame { size_t inputCount; size_t anchorCount; int frame; int tried; };
+// Dead-end states are remembered so the search never re-explores them.
+struct SolFrame { size_t inputCount; size_t anchorCount; int frame; int tried; std::string key; };
 struct Solver {
 	bool active = false;
 	int chunk = 12;
 	int frame = 0;        // end of the proven route
 	int k = 0;            // pattern being tried
 	int attempts = 0;
-	int maxAttempts = 5000;
+	int maxAttempts = 20000;
 	int desync = 0;
 	bool holding = false; // hold state at the end of the proven route
 	std::vector<SolFrame> stack;
 	std::vector<MacroAnchor> tmpAn;
+	std::set<std::string> dead;
+	std::string curKey = "start";
 	bool resolved = false;
 	int result = 0;       // 0 died, 1 survived the chunk, 2 lost sync
 	bool pendingReset = false;
@@ -214,7 +217,7 @@ static const SettingDef kSettings[] = {
 	{ "solve-chunk", "Solve chunk", 6, 40, 2, 12, nullptr, 1, "f" },
 	{ "solve-speed", "Solve speed", 1, 10, 1, 4, nullptr, 1, "x" },
 	// page 11: auto solver
-	{ "solve-tries", "Max tries", 500, 20000, 500, 5000, nullptr, 1, "" },
+	{ "solve-tries", "Max tries", 500, 20000, 500, 20000, nullptr, 1, "" },
 	{ "solve-tap", "Tap length", 2, 10, 1, 3, nullptr, 1, "f" },
 };
 static const int kSettingCount = 46;
@@ -685,7 +688,7 @@ static void solResolve(int kind) {
 
 // keep the chunk that was just played
 static void solCommit() {
-	g_sol.stack.push_back({ g_inputs.size(), g_anchors.size(), g_sol.frame, g_sol.k });
+	g_sol.stack.push_back({ g_inputs.size(), g_anchors.size(), g_sol.frame, g_sol.k, g_sol.curKey });
 	auto ev = solCandidate(g_sol.k);
 	for (auto& e : ev) {
 		g_inputs.push_back({ g_sol.frame + e.first, 1, e.second, true });
@@ -693,6 +696,14 @@ static void solCommit() {
 	}
 	for (auto& a : g_sol.tmpAn) g_anchors.push_back(a);
 	g_sol.tmpAn.clear();
+}
+
+// compact description of the player state at the end of a chunk
+static std::string solKey(MacroAnchor const& a, bool hold, int frame) {
+	char buf[160];
+	std::snprintf(buf, sizeof(buf), "%d|%.2f|%.2f|%.3f|%d|%.2f|%.2f|%.3f|%d",
+		frame, a.x1, a.y1, a.v1, a.dual ? 1 : 0, a.x2, a.y2, a.v2, hold ? 1 : 0);
+	return buf;
 }
 
 // 1 = keep going, -1 = no route, -2 = try limit, -3 = lost sync
@@ -705,19 +716,29 @@ static int solAdvance() {
 	}
 	g_sol.desync = 0;
 	if (g_sol.result == 1) {
-		solCommit();
-		g_sol.frame += g_sol.chunk;
-		g_sol.k = 0;
-		return 1;
+		bool h = g_sol.holding;
+		for (auto& e : solCandidate(g_sol.k)) h = e.second;
+		std::string endKey = g_sol.tmpAn.empty() ? std::string()
+			: solKey(g_sol.tmpAn.back(), h, g_sol.frame + g_sol.chunk);
+		if (endKey.empty() || !g_sol.dead.count(endKey)) {
+			solCommit();
+			g_sol.frame += g_sol.chunk;
+			g_sol.k = 0;
+			if (!endKey.empty()) g_sol.curKey = endKey;
+			return 1;
+		}
+		// this chunk leads to a state already known to be a dead end: treat as failed
 	}
 	g_sol.k++;
 	while (g_sol.k >= kSolCands) {
 		if (g_sol.stack.empty()) return -1;
+		g_sol.dead.insert(g_sol.curKey);
 		auto sf = g_sol.stack.back();
 		g_sol.stack.pop_back();
 		g_inputs.resize(sf.inputCount);
 		g_anchors.resize(sf.anchorCount);
 		g_sol.frame = sf.frame;
+		g_sol.curKey = sf.key;
 		g_sol.k = sf.tried + 1;
 		solRecomputeHold();
 	}
@@ -2251,13 +2272,35 @@ class $modify(PlayLayer) {
 			writeMacro(g_selected);
 		}
 		PlayLayer::resetLevel();
+
+		// frame we respawned at: 0 on a full restart, > 0 at a practice checkpoint
+		int startFrame = static_cast<int>(m_gameState.m_currentProgress);
+
 		if (g_mode == 1) {
-			g_inputs.clear();
-			g_anchors.clear();
-			g_windows.clear();
+			if (startFrame > 0) {
+				// practice checkpoint: keep everything recorded before it
+				g_inputs.erase(std::remove_if(g_inputs.begin(), g_inputs.end(),
+					[&](MacroInput const& i) { return i.frame >= startFrame; }), g_inputs.end());
+				g_anchors.erase(std::remove_if(g_anchors.begin(), g_anchors.end(),
+					[&](MacroAnchor const& a) { return a.frame >= startFrame; }), g_anchors.end());
+				for (auto it = g_windows.begin(); it != g_windows.end();) {
+					if (it->first >= static_cast<int>(g_inputs.size())) it = g_windows.erase(it);
+					else ++it;
+				}
+			} else {
+				g_inputs.clear();
+				g_anchors.clear();
+				g_windows.clear();
+			}
 		}
+
 		g_cursor = 0;
 		g_anchorCursor = 0;
+		if (g_mode == 2 && startFrame > 0) {
+			// playback from a checkpoint: skip what already happened
+			while (g_cursor < g_inputs.size() && g_inputs[g_cursor].frame < startFrame) g_cursor++;
+			while (g_anchorCursor < g_anchors.size() && g_anchors[g_anchorCursor].frame < startFrame) g_anchorCursor++;
+		}
 		g_lastAnchorFrame = -1;
 		g_corrections = 0;
 		g_pathDirty = true;

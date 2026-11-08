@@ -2395,12 +2395,20 @@ class $modify(PlayLayer) {
 	}
 
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
+		// During Test windows / Auto solve the game's own anti-cheat spike can appear on the
+		// player and end every run on the first step. Practice mode never submits anything,
+		// so only there the spike is skipped. Normal mode is not touched.
+		if ((g_mode == 3 || g_mode == 4) && m_isPracticeMode && object && object == m_anticheatSpike) {
+			g_diagDeath = "anti-cheat spike skipped (practice mode)";
+			return;
+		}
 		PlayLayer::destroyPlayer(player, object);
 		{
 			bool fresh = (g_mode == 3) ? (g_wt.active && !g_wt.resolved) : (g_mode == 4 && g_sol.active && !g_sol.resolved);
 			if (fresh && m_player1) {
 				char b[200];
-				std::snprintf(b, sizeof(b), "died: x %.1f y %.1f, object %d at x %.1f y %.1f",
+				std::snprintf(b, sizeof(b), "died (%s): x %.1f y %.1f, object %d at x %.1f y %.1f",
+					(object && object == m_anticheatSpike) ? "anti-cheat" : "level object",
 					static_cast<float>(m_player1->getPositionX()), static_cast<float>(m_player1->getPositionY()),
 					object ? static_cast<int>(object->m_objectID) : -1,
 					object ? static_cast<float>(object->getPositionX()) : 0.f,

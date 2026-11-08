@@ -1484,8 +1484,9 @@ protected:
 
 	void refreshLabels() {
 		if (m_modeLabel) {
-			char const* modes[] = { "Mode: Off", "Mode: Recording", "Mode: Playing" };
-			m_modeLabel->setString(modes[g_mode]);
+			// FIX: g_mode can be 3 (window test) or 4 (solver), so the table needs 5 entries
+			char const* modes[] = { "Mode: Off", "Mode: Recording", "Mode: Playing", "Mode: Testing", "Mode: Solving" };
+			m_modeLabel->setString(modes[std::clamp(g_mode, 0, 4)]);
 			fitLabel(m_modeLabel, m_colW, 0.55f);
 		}
 

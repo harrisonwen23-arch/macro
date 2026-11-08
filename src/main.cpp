@@ -20,7 +20,11 @@ static std::vector<MacroInput> g_inputs;
 static size_t g_cursor = 0;
 static bool g_injecting = false;
 static float g_speed = 1.f;
+static bool g_speedTouched = false; // true once the user changed speed
 static std::string g_selected;
+
+static constexpr float kSpeedMin = 0.1f;
+static constexpr float kSpeedMax = 5.f;
 
 // ---------- theme settings ----------
 
@@ -67,11 +71,30 @@ static CCMenuItemSpriteExtra* makeButton(char const* text, CCObject* target, SEL
 	return CCMenuItemSpriteExtra::create(spr, target, cb);
 }
 
-// ---------- macro files ----------
+// ---------- speed ----------
+
+// GD itself resets the scheduler time scale when a level restarts (its
+// time-warp logic writes it every reset), which is why speed used to
+// vanish after dying. We now re-apply it every frame, multiplied by the
+// level's own time warp so speed triggers still work.
+static void enforceSpeed(float timeWarp) {
+	if (!g_speedTouched) return;
+	if (timeWarp <= 0.f) timeWarp = 1.f;
+	CCDirector::get()->getScheduler()->setTimeScale(g_speed * timeWarp);
+}
 
 static void applySpeed() {
+	g_speedTouched = true;
 	CCDirector::get()->getScheduler()->setTimeScale(g_speed);
 }
+
+static void resetSpeed() {
+	g_speed = 1.f;
+	g_speedTouched = false;
+	CCDirector::get()->getScheduler()->setTimeScale(1.f);
+}
+
+// ---------- macro files ----------
 
 static std::filesystem::path macroDir() {
 	auto dir = Mod::get()->getSaveDir() / "macros";
@@ -279,6 +302,7 @@ protected:
 	CCLabelBMFont* m_modeLabel = nullptr;
 	CCLabelBMFont* m_selLabel = nullptr;
 	CCLabelBMFont* m_speedLabel = nullptr;
+	Slider* m_speedSlider = nullptr;
 	TextInput* m_input = nullptr;
 	ScrollLayer* m_list = nullptr;
 	float m_listW = 0.f;
@@ -346,18 +370,37 @@ protected:
 		addBtn("Delete", menu_selector(MacroPopup::onDelete), rightX + 30.f, y, 0.62f);
 		addBtn("New", menu_selector(MacroPopup::onNew), rightX + 91.f, y, 0.62f);
 
-		y -= 34.f;
-		addBtn("-", menu_selector(MacroPopup::onSpeedDown), rightX - 85.f, y, 0.8f);
+		// speed label + slider
+		y -= 32.f;
 		m_speedLabel = addLabel("", rightX, y, 0.6f);
-		addBtn("+", menu_selector(MacroPopup::onSpeedUp), rightX + 85.f, y, 0.8f);
 
-		y -= 34.f;
-		addBtn("Customize", menu_selector(MacroPopup::onCustomize), rightX, y, 0.62f);
+		y -= 24.f;
+		m_speedSlider = Slider::create(this, menu_selector(MacroPopup::onSpeedSlider), 0.6f);
+		m_speedSlider->setValue(speedToSlider(g_speed));
+		m_mainLayer->addChildAtPosition(m_speedSlider, Anchor::Center, { rightX, y });
+
+		// settings (gear) button, top-right of the panel
+		auto gear = CCSprite::createWithSpriteFrameName("GJ_optionsBtn02_001.png");
+		if (gear) {
+			gear->setScale(0.7f);
+			auto gearBtn = CCMenuItemSpriteExtra::create(gear, this, menu_selector(MacroPopup::onCustomize));
+			m_buttonMenu->addChildAtPosition(gearBtn, Anchor::TopRight, { -26.f, -26.f });
+		}
 
 		rebuildList();
 		refreshLabels();
 		g_manager = this;
 		return true;
+	}
+
+	static float speedToSlider(float s) {
+		return std::clamp((s - kSpeedMin) / (kSpeedMax - kSpeedMin), 0.f, 1.f);
+	}
+
+	static float sliderToSpeed(float v) {
+		float s = kSpeedMin + std::clamp(v, 0.f, 1.f) * (kSpeedMax - kSpeedMin);
+		s = std::round(s * 20.f) / 20.f; // snap to 0.05
+		return std::clamp(s, kSpeedMin, kSpeedMax);
 	}
 
 	CCLabelBMFont* addLabel(char const* text, float x, float y, float scale) {
@@ -510,15 +553,9 @@ protected:
 		notify("Renamed");
 	}
 
-	void onSpeedDown(CCObject*) {
-		g_speed = std::max(0.1f, g_speed - 0.25f);
-		if (g_speed < 0.2f) g_speed = 0.1f;
-		applySpeed();
-		refreshLabels();
-	}
-
-	void onSpeedUp(CCObject*) {
-		g_speed = std::min(5.f, g_speed + 0.25f);
+	void onSpeedSlider(CCObject* sender) {
+		auto thumb = static_cast<SliderThumb*>(sender);
+		g_speed = sliderToSpeed(thumb->getValue());
 		applySpeed();
 		refreshLabels();
 	}
@@ -641,6 +678,12 @@ void MacroPopup::onCustomize(CCObject*) {
 // ---------- hooks ----------
 
 class $modify(GJBaseGameLayer) {
+	void update(float dt) {
+		GJBaseGameLayer::update(dt);
+		// keep user speed alive through deaths/restarts/time-warp resets
+		enforceSpeed(m_gameState.m_timeWarp);
+	}
+
 	void handleButton(bool down, int button, bool p1) {
 		if (g_mode == 2 && !g_injecting) return;
 		if (g_mode == 1) {
@@ -673,6 +716,8 @@ class $modify(PlayLayer) {
 		PlayLayer::resetLevel();
 		if (g_mode == 1) g_inputs.clear();
 		g_cursor = 0;
+		// resetLevel clears the scheduler time scale; put our speed back
+		enforceSpeed(m_gameState.m_timeWarp);
 	}
 
 	void levelComplete() {
@@ -694,8 +739,7 @@ class $modify(PlayLayer) {
 	}
 
 	void onQuit() {
-		g_speed = 1.f;
-		applySpeed();
+		resetSpeed();
 		PlayLayer::onQuit();
 	}
 };

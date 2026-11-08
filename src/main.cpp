@@ -2936,3 +2936,115 @@ class $modify(PlayLayer) {
 				g_sol.pendingAdvance = false;
 				int r = solAdvance();
 				
+				if (r != 1) {
+					solFinish(r);
+					return;
+				}
+			}
+			if (g_sol.attempts == 0 && g_sol.frame == 0 && startFrame > 0) g_sol.frame = startFrame;
+			solBuildWork();
+			g_sol.resolved = false;
+			g_solSteps = 0;
+			g_lastAnchorFrame = -1;
+			while (g_cursor < g_work.size() && g_work[g_cursor].frame < startFrame) g_cursor++;
+			while (g_anchorCursor < g_anchors.size() && g_anchors[g_anchorCursor].frame < startFrame) g_anchorCursor++;
+		}
+	}
+
+	void destroyPlayer(PlayerObject* player, GameObject* obj) {
+		// window test / solver: a death only decides the attempt, then the level is restarted
+		if ((g_mode == 3 && g_wt.active) || (g_mode == 4 && g_sol.active)) {
+			char b[200];
+			std::snprintf(b, sizeof(b), "death: x %.1f y %.1f vy %.2f frame %d obj %d",
+				player ? static_cast<float>(player->getPositionX()) : 0.f,
+				player ? static_cast<float>(player->getPositionY()) : 0.f,
+				player ? static_cast<float>(player->m_yVelocity) : 0.f,
+				g_frame, obj ? static_cast<int>(obj->m_objectID) : -1);
+			if (g_mode == 3) {
+				g_diagDeath = b;
+				if (!g_wt.resolved) {
+					if (g_wt.phase == 0) {
+						g_wt.baseEnd = g_frame;
+						wtResolve(true);
+					} else {
+						wtResolve(false);
+					}
+				}
+			} else if (!g_sol.resolved) {
+				g_diagDeath = b;
+				g_solDeathFrame = g_frame;
+				g_solDeathX = player ? static_cast<float>(player->getPositionX()) : 0.f;
+				g_solDeathObj = obj ? static_cast<int>(obj->m_objectID) : -1;
+				// dying inside the part that was already proven means the replay drifted
+				if (g_frame < g_sol.frame) solResolve(2);
+				else solResolve(0);
+			}
+			return;
+		}
+		PlayLayer::destroyPlayer(player, obj);
+	}
+
+	void levelComplete() {
+		if (g_mode == 3 && g_wt.active) {
+			if (!g_wt.resolved) {
+				if (g_wt.phase == 0) g_wt.baseEnd = 0x7fffffff;
+				wtResolve(true);
+			}
+			return;
+		}
+		if (g_mode == 4 && g_sol.active) {
+			if (!g_sol.resolved) {
+				g_sol.resolved = true;
+				solCommit();
+				solFinish(0);
+			}
+			PlayLayer::levelComplete();
+			return;
+		}
+		if (g_mode == 1 && !g_inputs.empty() && !g_selected.empty()) {
+			writeMacro(g_selected);
+		}
+		PlayLayer::levelComplete();
+	}
+
+	void onQuit() {
+		if (g_mode == 1 && !g_inputs.empty() && !g_selected.empty()) {
+			writeMacro(g_selected);
+		} else if (g_mode == 3) {
+			g_mode = 0;
+			wtRestoreSpeed();
+			spClear();
+			g_wt.active = false;
+			g_wt.pendingReset = false;
+			g_wt.pendingAdvance = false;
+		} else if (g_mode == 4) {
+			solFinish(3);
+		}
+		PlayLayer::onQuit();
+	}
+};
+
+class $modify(MacroPauseLayer, PauseLayer) {
+	void customSetup() {
+		PauseLayer::customSetup();
+
+		auto ws = CCDirector::get()->getWinSize();
+		auto menu = CCMenu::create();
+		menu->setPosition({ 0.f, 0.f });
+
+		auto btn = makeButton("Macro", this, menu_selector(MacroPauseLayer::onMacroOpen), 0.6f);
+		int corner = std::clamp(S("pause-corner"), 0, 3);
+		bool left = (corner == 1 || corner == 3);
+		bool top = corner >= 2;
+		float x = left ? 50.f : ws.width - 50.f;
+		float y = top ? ws.height - 25.f : 25.f;
+		btn->setPosition({ x, y });
+		menu->addChild(btn);
+
+		this->addChild(menu, 100);
+	}
+
+	void onMacroOpen(CCObject*) {
+		if (auto popup = MacroPopup::create()) popup->show();
+	}
+};

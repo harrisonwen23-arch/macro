@@ -2175,13 +2175,10 @@ class $modify(GJBaseGameLayer) {
 			{ 85, 210, 105 }, { 140, 215, 255 }, { 110, 110, 250 }
 		};
 		auto root = m_uiLayer->getChildByID("macro-tally");
-		auto rings = m_objectLayer ? static_cast<CCDrawNode*>(m_objectLayer->getChildByID("macro-rings")) : nullptr;
+		auto rings = m_objectLayer ? m_objectLayer->getChildByID("macro-rings") : nullptr;
 		if (!on) {
 			if (root) root->setVisible(false);
-			if (rings) {
-				rings->clear();
-				rings->setVisible(false);
-			}
+			if (rings) rings->removeAllChildrenWithCleanup(true);
 			return;
 		}
 
@@ -2223,7 +2220,7 @@ class $modify(GJBaseGameLayer) {
 		float topY = ws.height * 0.8f;
 		for (int i = 0; i < 7; i++) {
 			int row = 6 - i; // biggest windows on top
-			float y = topY - row * 44.f * sc;
+			float y = topY - row * 30.f * sc;
 			auto nm = static_cast<CCLabelBMFont*>(root->getChildByTag(100 + i));
 			auto ct = static_cast<CCLabelBMFont*>(root->getChildByTag(200 + i));
 			if (!nm || !ct) continue;
@@ -2239,61 +2236,61 @@ class $modify(GJBaseGameLayer) {
 			ct->setOpacity(235);
 		}
 
-		// rings at the next clicks, with the window size next to each
-		if (!m_objectLayer) return;
-		if (S("win-ring") == 0 || g_anchors.empty()) {
-			if (rings) {
-				rings->clear();
-				rings->setVisible(false);
-			}
+		// rings are added when a click is registered (addRingMark) and removed here
+		// once they have scrolled off the left side of the screen
+		if (!m_objectLayer || !rings) return;
+		if (S("win-ring") == 0) {
+			rings->removeAllChildrenWithCleanup(true);
 			return;
 		}
-		if (!rings) {
-			rings = CCDrawNode::create();
-			rings->setID("macro-rings");
-			for (int i = 0; i < 3; i++) {
-				auto lab = CCLabelBMFont::create("", "bigFont.fnt");
-				lab->setTag(300 + i);
-				lab->setScale(0.5f);
-				rings->addChild(lab);
+		if (auto kids = rings->getChildren()) {
+			for (int i = static_cast<int>(kids->count()) - 1; i >= 0; i--) {
+				auto n = static_cast<CCNode*>(kids->objectAtIndex(i));
+				if (m_objectLayer->convertToWorldSpace(n->getPosition()).x < -60.f) n->removeFromParent();
 			}
-			m_objectLayer->addChild(rings, 501);
 		}
-		rings->setVisible(true);
-		rings->clear();
-		int shown = 0;
-		for (size_t i = g_cursor; i < g_inputs.size() && shown < 3; i++) {
-			auto& in = g_inputs[i];
-			if (!in.down) continue;
-			if (in.frame > g_frame + 150) break;
-			auto wit = g_windows.find(static_cast<int>(i));
-			if (wit == g_windows.end()) continue;
-			auto a = std::lower_bound(g_anchors.begin(), g_anchors.end(), in.frame,
-				[](MacroAnchor const& m, int f) { return m.frame < f; });
-			if (a == g_anchors.end()) break;
-			int w = wit->second.first + wit->second.second + 1;
-			auto col = cols[winBucket(w)];
-			ccColor4F c4 = ccc4f(col.r / 255.f, col.g / 255.f, col.b / 255.f, 0.95f);
-			float r = 14.f;
-			const int segs = 28;
-			for (int k = 0; k < segs; k++) {
-				float a0 = k * 6.2831853f / segs;
-				float a1 = (k + 1) * 6.2831853f / segs;
-				rings->drawSegment(
-					{ a->x1 + r * std::cos(a0), a->y1 + r * std::sin(a0) },
-					{ a->x1 + r * std::cos(a1), a->y1 + r * std::sin(a1) }, 1.8f, c4);
-			}
-			if (auto lab = static_cast<CCLabelBMFont*>(rings->getChildByTag(300 + shown))) {
-				lab->setVisible(true);
-				lab->setString(std::to_string(w).c_str());
-				lab->setColor(col);
-				lab->setPosition({ a->x1 - r - 12.f, a->y1 });
-			}
-			shown++;
+	}
+
+	// A ring with the window size next to it, placed on the player where a click
+	// was just registered. It stays in the level, so it scrolls away with it.
+	void addRingMark(float x, float y, int w) {
+		if (!m_objectLayer) return;
+		static const ccColor3B cols[7] = {
+			{ 240, 75, 75 }, { 250, 160, 60 }, { 250, 225, 70 }, { 255, 255, 255 },
+			{ 85, 210, 105 }, { 140, 215, 255 }, { 110, 110, 250 }
+		};
+		auto root = m_objectLayer->getChildByID("macro-rings");
+		if (!root) {
+			root = CCNode::create();
+			root->setID("macro-rings");
+			m_objectLayer->addChild(root, 501);
 		}
-		for (int k = shown; k < 3; k++) {
-			if (auto lab = rings->getChildByTag(300 + k)) lab->setVisible(false);
+		if (root->getChildrenCount() > 120) return;
+
+		auto col = cols[winBucket(w)];
+		ccColor4F c4 = ccc4f(col.r / 255.f, col.g / 255.f, col.b / 255.f, 0.95f);
+		auto mark = CCNode::create();
+		mark->setPosition({ x, y });
+
+		auto draw = CCDrawNode::create();
+		float r = 14.f;
+		const int segs = 24;
+		for (int k = 0; k < segs; k++) {
+			float a0 = k * 6.2831853f / segs;
+			float a1 = (k + 1) * 6.2831853f / segs;
+			draw->drawSegment(
+				{ r * std::cos(a0), r * std::sin(a0) },
+				{ r * std::cos(a1), r * std::sin(a1) }, 1.8f, c4);
 		}
+		mark->addChild(draw);
+
+		auto lab = CCLabelBMFont::create(std::to_string(w).c_str(), "bigFont.fnt");
+		lab->setScale(0.5f);
+		lab->setColor(col);
+		lab->setPosition({ -r - 12.f, 0.f });
+		mark->addChild(lab);
+
+		root->addChild(mark);
 	}
 
 	// ----- frame window counter -----
@@ -2622,6 +2619,13 @@ class $modify(GJBaseGameLayer) {
 				g_injecting = true;
 				GJBaseGameLayer::handleButton(i.down, i.button, i.p1);
 				g_injecting = false;
+				if (g_mode == 2 && i.down && m_player1 && S("win-hud") != 0 && S("win-style") == 1 && S("win-ring") != 0) {
+					auto wit = g_windows.find(static_cast<int>(g_cursor) - 1);
+					if (wit != g_windows.end()) {
+						addRingMark(static_cast<float>(m_player1->getPositionX()), static_cast<float>(m_player1->getPositionY()),
+							wit->second.first + wit->second.second + 1);
+					}
+				}
 			}
 			if (g_mode == 3 && g_wt.active && g_wt.phase != 0 && !g_wt.resolved && frame >= g_wt.endFrame) {
 				wtResolve(true);
@@ -2675,6 +2679,9 @@ class $modify(PlayLayer) {
 		g_corrections = 0;
 		g_pathDirty = true;
 		g_diagPending = (g_mode == 3 || g_mode == 4);
+		if (m_objectLayer) {
+			if (auto rr = m_objectLayer->getChildByID("macro-rings")) rr->removeAllChildrenWithCleanup(true);
+		}
 		g_frameBase = 0;
 		g_spNeedBase = false;
 		g_spVerify = 0;

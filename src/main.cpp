@@ -4,6 +4,8 @@
 #include <Geode/modify/PauseLayer.hpp>
 #include <fstream>
 #include <cstdio>
+#include <cstdlib>
+#include <cmath>
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -19,6 +21,53 @@ static size_t g_cursor = 0;
 static bool g_injecting = false;
 static float g_speed = 1.f;
 static std::string g_selected;
+
+// ---------- theme settings ----------
+
+struct ColorPreset { char const* name; ccColor3B color; };
+static const ColorPreset kColors[] = {
+	{ "Midnight", { 15, 18, 48 } },
+	{ "Purple", { 45, 20, 80 } },
+	{ "Teal", { 10, 55, 65 } },
+	{ "Crimson", { 75, 15, 30 } },
+	{ "Forest", { 15, 55, 35 } },
+	{ "Slate", { 38, 40, 48 } },
+	{ "Rose", { 95, 30, 75 } },
+};
+static const int kColorCount = 7;
+
+struct ShapeDef { char const* name; char const* tex; };
+static const ShapeDef kShapes[] = {
+	{ "Rounded", "square02b_001.png" },
+	{ "Soft", "square02_001.png" },
+	{ "Classic", "GJ_square01.png" },
+	{ "Dark", "GJ_square05.png" },
+};
+static const int kShapeCount = 4;
+
+static int getInt(char const* key, int def) {
+	return Mod::get()->getSavedValue<int>(key, def);
+}
+
+static void setInt(char const* key, int v) {
+	Mod::get()->setSavedValue<int>(key, v);
+}
+
+static CCScale9Sprite* makePanel(int shape, int color, CCSize size) {
+	auto panel = CCScale9Sprite::create(kShapes[shape].tex, { 0.f, 0.f, 80.f, 80.f });
+	if (!panel) panel = CCScale9Sprite::create("square02b_001.png", { 0.f, 0.f, 80.f, 80.f });
+	panel->setColor(kColors[color].color);
+	panel->setContentSize(size);
+	return panel;
+}
+
+static CCMenuItemSpriteExtra* makeButton(char const* text, CCObject* target, SEL_MenuHandler cb, float scale) {
+	auto spr = ButtonSprite::create(text);
+	spr->setScale(scale);
+	return CCMenuItemSpriteExtra::create(spr, target, cb);
+}
+
+// ---------- macro files ----------
 
 static void applySpeed() {
 	CCDirector::get()->getScheduler()->setTimeScale(g_speed);
@@ -116,6 +165,115 @@ static void showSavedBox(std::string const& text) {
 	scene->addChild(node, 10000);
 }
 
+// ---------- shooting star background ----------
+
+static ccColor4F starColor(float r, float g, float b, float a) {
+	return ccc4f(r * a, g * a, b * a, a);
+}
+
+class StarField : public CCNode {
+protected:
+	struct Shoot { float x0, y0, dx, dy, len, t, speed; };
+	struct Twinkle { float x, y, phase, speed, size; };
+
+	CCDrawNode* m_draw = nullptr;
+	CCSize m_area;
+	std::vector<Shoot> m_shoots;
+	std::vector<Twinkle> m_twinkles;
+
+	static float rnd() {
+		return static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+	}
+
+	void respawn(Shoot& s) {
+		float ang = 0.55f + rnd() * 0.35f;
+		float maxLen = std::min(m_area.width, m_area.height) * 0.7f;
+		s.len = std::min(maxLen, 90.f + rnd() * 90.f);
+		float lx = s.len * std::cos(ang);
+		float ly = s.len * std::sin(ang);
+		s.x0 = lx + rnd() * std::max(1.f, m_area.width - lx - 14.f);
+		s.y0 = ly + rnd() * std::max(1.f, m_area.height - ly - 14.f);
+		s.dx = -lx;
+		s.dy = -ly;
+		s.t = -rnd() * 2.f;
+		s.speed = 0.4f + rnd() * 0.4f;
+	}
+
+	bool init(CCSize area) {
+		if (!CCNode::init()) return false;
+		m_area = area;
+		m_draw = CCDrawNode::create();
+		this->addChild(m_draw);
+
+		for (int i = 0; i < 40; i++) {
+			m_twinkles.push_back({
+				rnd() * area.width, rnd() * area.height,
+				rnd() * 6.28f, 1.f + rnd() * 2.f, 0.5f + rnd() * 1.1f
+			});
+		}
+		for (int i = 0; i < 4; i++) {
+			Shoot s{};
+			respawn(s);
+			s.t -= static_cast<float>(i) * 0.6f;
+			m_shoots.push_back(s);
+		}
+		this->scheduleUpdate();
+		return true;
+	}
+
+	void update(float dt) override {
+		m_draw->clear();
+
+		for (auto& tw : m_twinkles) {
+			tw.phase += dt * tw.speed;
+			float a = 0.25f + 0.55f * (0.5f + 0.5f * std::sin(tw.phase));
+			m_draw->drawDot({ tw.x, tw.y }, tw.size, starColor(0.8f, 0.9f, 1.f, a));
+		}
+
+		for (auto& s : m_shoots) {
+			s.t += dt * s.speed;
+			if (s.t >= 1.f) {
+				respawn(s);
+				continue;
+			}
+			if (s.t < 0.f) continue;
+
+			float fade = std::sin(3.14159f * s.t);
+			CCPoint head = { s.x0 + s.dx * s.t, s.y0 + s.dy * s.t };
+			float ux = -s.dx / s.len;
+			float uy = -s.dy / s.len;
+			float trail = std::min(s.len * s.t, 80.f);
+
+			const int segs = 8;
+			for (int k = 0; k < segs; k++) {
+				float a0 = static_cast<float>(k) / segs;
+				float a1 = static_cast<float>(k + 1) / segs;
+				CCPoint p0 = { head.x + ux * trail * a0, head.y + uy * trail * a0 };
+				CCPoint p1 = { head.x + ux * trail * a1, head.y + uy * trail * a1 };
+				float alpha = fade * std::pow(1.f - a0, 1.5f);
+				m_draw->drawSegment(p0, p1, 1.4f * (1.f - a0) + 0.3f, starColor(0.75f, 0.88f, 1.f, alpha));
+			}
+			m_draw->drawDot(head, 2.2f, starColor(1.f, 1.f, 1.f, fade));
+		}
+	}
+
+public:
+	static StarField* create(CCSize area) {
+		auto ret = new StarField();
+		if (ret->init(area)) {
+			ret->autorelease();
+			return ret;
+		}
+		delete ret;
+		return nullptr;
+	}
+};
+
+// ---------- manager popup ----------
+
+class MacroPopup;
+static MacroPopup* g_manager = nullptr;
+
 class MacroPopup : public Popup {
 protected:
 	CCLabelBMFont* m_modeLabel = nullptr;
@@ -127,11 +285,24 @@ protected:
 
 	bool init() {
 		auto ws = CCDirector::get()->getWinSize();
-		float pw = ws.width * 0.9f;
-		float ph = ws.height * 0.9f;
+		int sizePct = std::clamp(getInt("ui-size", 90), 85, 100);
+		int shape = std::clamp(getInt("ui-shape", 0), 0, kShapeCount - 1);
+		int color = std::clamp(getInt("ui-color", 0), 0, kColorCount - 1);
+
+		float pw = ws.width * sizePct / 100.f;
+		float ph = ws.height * sizePct / 100.f;
 		if (!Popup::init(pw, ph)) return false;
 
+		m_bgSprite->setVisible(false);
 		this->setTitle("Macro Manager");
+
+		auto panel = makePanel(shape, color, { pw, ph });
+		m_mainLayer->addChildAtPosition(panel, Anchor::Center);
+		panel->setZOrder(-10);
+
+		auto stars = StarField::create({ pw, ph });
+		m_mainLayer->addChildAtPosition(stars, Anchor::Center, { -pw / 2.f, -ph / 2.f });
+		stars->setZOrder(-9);
 
 		float leftX = -pw * 0.23f;
 		float rightX = pw * 0.25f;
@@ -140,11 +311,11 @@ protected:
 		float listY = -12.f;
 		float top = ph / 2.f;
 
-		auto bg = CCScale9Sprite::create("square02b_001.png", { 0.f, 0.f, 80.f, 80.f });
-		bg->setColor({ 0, 0, 0 });
-		bg->setOpacity(110);
-		bg->setContentSize({ m_listW + 10.f, listH + 10.f });
-		m_mainLayer->addChildAtPosition(bg, Anchor::Center, { leftX, listY });
+		auto listBg = CCScale9Sprite::create("square02b_001.png", { 0.f, 0.f, 80.f, 80.f });
+		listBg->setColor({ 0, 0, 0 });
+		listBg->setOpacity(110);
+		listBg->setContentSize({ m_listW + 10.f, listH + 10.f });
+		m_mainLayer->addChildAtPosition(listBg, Anchor::Center, { leftX, listY });
 
 		m_list = ScrollLayer::create(CCSize{ m_listW, listH });
 		m_list->ignoreAnchorPointForPosition(false);
@@ -152,36 +323,40 @@ protected:
 		m_list->m_contentLayer->setLayout(ScrollLayer::createDefaultListLayout());
 		m_mainLayer->addChildAtPosition(m_list, Anchor::Center, { leftX, listY });
 
-		float y = top - 52.f;
+		float y = top - 50.f;
 		m_modeLabel = addLabel("", rightX, y, 0.65f);
 
-		y -= 34.f;
+		y -= 32.f;
 		addBtn("Record", menu_selector(MacroPopup::onRecord), rightX - 55.f, y, 0.7f);
 		addBtn("Play", menu_selector(MacroPopup::onPlay), rightX + 21.f, y, 0.7f);
 		addBtn("Off", menu_selector(MacroPopup::onOff), rightX + 81.f, y, 0.7f);
 
-		y -= 34.f;
+		y -= 32.f;
 		m_selLabel = addLabel("", rightX, y, 0.5f);
 
-		y -= 36.f;
+		y -= 34.f;
 		m_input = TextInput::create(130.f, "New name");
 		m_input->setMaxCharCount(24);
 		m_mainLayer->addChildAtPosition(m_input, Anchor::Center, { rightX - 45.f, y });
 		addBtn("Rename", menu_selector(MacroPopup::onRename), rightX + 72.f, y, 0.7f);
 
-		y -= 34.f;
+		y -= 32.f;
 		addBtn("Save", menu_selector(MacroPopup::onSave), rightX - 88.f, y, 0.62f);
 		addBtn("Load", menu_selector(MacroPopup::onLoad), rightX - 33.f, y, 0.62f);
 		addBtn("Delete", menu_selector(MacroPopup::onDelete), rightX + 30.f, y, 0.62f);
 		addBtn("New", menu_selector(MacroPopup::onNew), rightX + 91.f, y, 0.62f);
 
-		y -= 38.f;
+		y -= 34.f;
 		addBtn("-", menu_selector(MacroPopup::onSpeedDown), rightX - 85.f, y, 0.8f);
 		m_speedLabel = addLabel("", rightX, y, 0.6f);
 		addBtn("+", menu_selector(MacroPopup::onSpeedUp), rightX + 85.f, y, 0.8f);
 
+		y -= 34.f;
+		addBtn("Customize", menu_selector(MacroPopup::onCustomize), rightX, y, 0.62f);
+
 		rebuildList();
 		refreshLabels();
+		g_manager = this;
 		return true;
 	}
 
@@ -193,8 +368,7 @@ protected:
 	}
 
 	CCMenuItemSpriteExtra* addBtn(char const* text, SEL_MenuHandler cb, float x, float y, float scale) {
-		auto btn = CCMenuItemSpriteExtra::create(ButtonSprite::create(text), this, cb);
-		btn->setScale(scale);
+		auto btn = makeButton(text, this, cb, scale);
 		m_buttonMenu->addChildAtPosition(btn, Anchor::Center, { x, y });
 		return btn;
 	}
@@ -221,8 +395,8 @@ protected:
 				name.c_str(), static_cast<int>((m_listW - 24.f) / scale), true,
 				"bigFont.fnt", sel ? "GJ_button_02.png" : "GJ_button_01.png", 30.f, 0.8f
 			);
+			spr->setScale(scale);
 			auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(MacroPopup::onPick));
-			btn->setScale(scale);
 			btn->setID(name);
 			row->addChildAtPosition(btn, Anchor::Center);
 			content->addChild(row);
@@ -349,7 +523,17 @@ protected:
 		refreshLabels();
 	}
 
+	void onCustomize(CCObject*);
+
 public:
+	~MacroPopup() {
+		if (g_manager == this) g_manager = nullptr;
+	}
+
+	void closeManager() {
+		this->keyBackClicked();
+	}
+
 	static MacroPopup* create() {
 		auto ret = new MacroPopup();
 		if (ret->init()) {
@@ -360,6 +544,101 @@ public:
 		return nullptr;
 	}
 };
+
+// ---------- customizer popup ----------
+
+class CustomizePopup : public Popup {
+protected:
+	int m_size = 90;
+	int m_shape = 0;
+	int m_color = 0;
+	CCLabelBMFont* m_sizeLabel = nullptr;
+	CCLabelBMFont* m_shapeLabel = nullptr;
+	CCLabelBMFont* m_colorLabel = nullptr;
+	CCScale9Sprite* m_preview = nullptr;
+
+	bool init() {
+		if (!Popup::init(310.f, 220.f)) return false;
+		this->setTitle("Customize UI");
+
+		m_size = std::clamp(getInt("ui-size", 90), 85, 100);
+		m_shape = std::clamp(getInt("ui-shape", 0), 0, kShapeCount - 1);
+		m_color = std::clamp(getInt("ui-color", 0), 0, kColorCount - 1);
+
+		m_sizeLabel = addRow("Size", 45.f, menu_selector(CustomizePopup::onSizeDown), menu_selector(CustomizePopup::onSizeUp));
+		m_shapeLabel = addRow("Shape", 10.f, menu_selector(CustomizePopup::onShapePrev), menu_selector(CustomizePopup::onShapeNext));
+		m_colorLabel = addRow("Colour", -25.f, menu_selector(CustomizePopup::onColorPrev), menu_selector(CustomizePopup::onColorNext));
+
+		auto apply = makeButton("Apply", this, menu_selector(CustomizePopup::onApply), 0.8f);
+		m_buttonMenu->addChildAtPosition(apply, Anchor::Center, { 0.f, -72.f });
+
+		refresh();
+		return true;
+	}
+
+	CCLabelBMFont* addRow(char const* name, float y, SEL_MenuHandler minus, SEL_MenuHandler plus) {
+		auto title = CCLabelBMFont::create(name, "bigFont.fnt");
+		title->setScale(0.45f);
+		m_mainLayer->addChildAtPosition(title, Anchor::Center, { -115.f, y });
+
+		auto value = CCLabelBMFont::create("", "bigFont.fnt");
+		value->setScale(0.5f);
+		m_mainLayer->addChildAtPosition(value, Anchor::Center, { 0.f, y });
+
+		auto minusBtn = makeButton("<", this, minus, 0.7f);
+		m_buttonMenu->addChildAtPosition(minusBtn, Anchor::Center, { -55.f, y });
+		auto plusBtn = makeButton(">", this, plus, 0.7f);
+		m_buttonMenu->addChildAtPosition(plusBtn, Anchor::Center, { 55.f, y });
+		return value;
+	}
+
+	void refresh() {
+		char buf[16];
+		std::snprintf(buf, sizeof(buf), "%d%%", m_size);
+		m_sizeLabel->setString(buf);
+		m_shapeLabel->setString(kShapes[m_shape].name);
+		m_colorLabel->setString(kColors[m_color].name);
+
+		if (m_preview) m_preview->removeFromParent();
+		m_preview = makePanel(m_shape, m_color, { 70.f, 52.f });
+		m_mainLayer->addChildAtPosition(m_preview, Anchor::Center, { 112.f, 10.f });
+	}
+
+	void onSizeDown(CCObject*) { m_size = std::max(85, m_size - 5); refresh(); }
+	void onSizeUp(CCObject*) { m_size = std::min(100, m_size + 5); refresh(); }
+	void onShapePrev(CCObject*) { m_shape = (m_shape + kShapeCount - 1) % kShapeCount; refresh(); }
+	void onShapeNext(CCObject*) { m_shape = (m_shape + 1) % kShapeCount; refresh(); }
+	void onColorPrev(CCObject*) { m_color = (m_color + kColorCount - 1) % kColorCount; refresh(); }
+	void onColorNext(CCObject*) { m_color = (m_color + 1) % kColorCount; refresh(); }
+
+	void onApply(CCObject*) {
+		setInt("ui-size", m_size);
+		setInt("ui-shape", m_shape);
+		setInt("ui-color", m_color);
+
+		auto old = g_manager;
+		if (old) old->closeManager();
+		if (auto popup = MacroPopup::create()) popup->show();
+		this->keyBackClicked();
+	}
+
+public:
+	static CustomizePopup* create() {
+		auto ret = new CustomizePopup();
+		if (ret->init()) {
+			ret->autorelease();
+			return ret;
+		}
+		delete ret;
+		return nullptr;
+	}
+};
+
+void MacroPopup::onCustomize(CCObject*) {
+	if (auto popup = CustomizePopup::create()) popup->show();
+}
+
+// ---------- hooks ----------
 
 class $modify(GJBaseGameLayer) {
 	void handleButton(bool down, int button, bool p1) {
@@ -425,9 +704,7 @@ class $modify(MacroPause, PauseLayer) {
 	void customSetup() {
 		PauseLayer::customSetup();
 		auto menu = CCMenu::create();
-		auto btn = CCMenuItemSpriteExtra::create(
-			ButtonSprite::create("Macro"), this, menu_selector(MacroPause::onOpenMacro)
-		);
+		auto btn = makeButton("Macro", this, menu_selector(MacroPause::onOpenMacro), 1.f);
 		menu->addChild(btn);
 		menu->setPosition(CCDirector::get()->getWinSize().width - 60.f, 40.f);
 		this->addChild(menu);

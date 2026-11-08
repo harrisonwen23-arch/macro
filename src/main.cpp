@@ -181,12 +181,15 @@ static const SettingDef kSettings[] = {
 	{ "win-size", "Counter size", 50, 100, 10, 70, nullptr, 1, "%" },
 	{ "win-max", "Test range", 1, 10, 1, 6, nullptr, 1, "f" },
 	{ "win-after", "Test survive", 10, 120, 10, 40, nullptr, 1, "f" },
+	// page 10: exact route
+	{ "exact-route", "Exact route", 0, 1, 1, 1, kOffOn, 1, "" },
+	{ "route-vel", "Restore speed", 0, 1, 1, 1, kOffOn, 1, "" },
 };
-static const int kSettingCount = 40;
+static const int kSettingCount = 42;
 static const int kRowsPerPage = 4;
-static const int kPageCount = 10;
+static const int kPageCount = 11;
 static char const* const kPageTitles[] = {
-	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder", "Window"
+	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder", "Window", "Route"
 };
 
 struct ThemeVal { char const* key; int val; };
@@ -1933,8 +1936,9 @@ class $modify(GJBaseGameLayer) {
 		int ahead = aheadVals[std::clamp(S("pf-ahead"), 0, 3)];
 
 		size_t start = (route && g_anchorCursor > 0) ? g_anchorCursor - 1 : 0;
-		for (size_t i = start + 1; i < g_anchors.size(); i++) {
-			auto& a = g_anchors[i - 1];
+		size_t stride = std::max<size_t>(1, g_anchors.size() / 600);
+		for (size_t i = start + stride; i < g_anchors.size(); i += stride) {
+			auto& a = g_anchors[i - stride];
 			auto& b = g_anchors[i];
 			if (route && ahead > 0 && b.frame > g_frame + ahead) break;
 			node->drawSegment({ a.x1, a.y1 }, { b.x1, b.y1 }, w, col);
@@ -1958,7 +1962,8 @@ class $modify(GJBaseGameLayer) {
 
 	void recordAnchor(int frame) {
 		if (!m_player1) return;
-		if (frame % anchorEvery() != 0 || frame == g_lastAnchorFrame) return;
+		int every = S("exact-route") ? 1 : anchorEvery();
+		if (frame % every != 0 || frame == g_lastAnchorFrame) return;
 		g_lastAnchorFrame = frame;
 
 		MacroAnchor a{};
@@ -1976,8 +1981,18 @@ class $modify(GJBaseGameLayer) {
 	}
 
 	// Position only: velocity is left alone so clicks keep working.
-	void alignPlayer(PlayerObject* p, float x, float y) {
-		if (!p || !anchorsOn()) return;
+	void alignPlayer(PlayerObject* p, float x, float y, float v) {
+		if (!p) return;
+		if (S("exact-route")) {
+			// exact route: put the player on the recorded spot every frame
+			float ex = p->getPositionX() - x;
+			float ey = p->getPositionY() - y;
+			if (std::fabs(ex) > 0.5f || std::fabs(ey) > 0.5f) g_corrections++;
+			p->setPosition({ x, y });
+			if (S("route-vel")) p->m_yVelocity = v;
+			return;
+		}
+		if (!anchorsOn()) return;
 		float tol = anchorTol();
 		float dx = p->getPositionX() - x;
 		float dy = p->getPositionY() - y;
@@ -1991,8 +2006,8 @@ class $modify(GJBaseGameLayer) {
 		while (g_anchorCursor < g_anchors.size() && g_anchors[g_anchorCursor].frame <= frame) {
 			auto& a = g_anchors[g_anchorCursor++];
 			if (a.frame != frame) continue;
-			alignPlayer(m_player1, a.x1, a.y1);
-			if (a.dual && m_gameState.m_isDualMode) alignPlayer(m_player2, a.x2, a.y2);
+			alignPlayer(m_player1, a.x1, a.y1, a.v1);
+			if (a.dual && m_gameState.m_isDualMode) alignPlayer(m_player2, a.x2, a.y2, a.v2);
 		}
 	}
 

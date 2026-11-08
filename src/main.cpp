@@ -15,6 +15,8 @@
 #include <cctype>
 #include <map>
 #include <set>
+#include <vector>
+#include <utility>
 #include <filesystem>
 #include <system_error>
 
@@ -234,6 +236,13 @@ static CCMenuItemSpriteExtra* makeButton(char const* text, CCObject* target, SEL
 	auto spr = ButtonSprite::create(text);
 	spr->setScale(scale);
 	return CCMenuItemSpriteExtra::create(spr, target, cb);
+}
+
+// Shrinks a label so it never grows wider than maxW.
+static void fitLabel(CCLabelBMFont* label, float maxW, float scale) {
+	label->setScale(scale);
+	float w = label->getContentSize().width;
+	if (w > 0.f && w * scale > maxW) label->setScale(maxW / w);
 }
 
 // ---------- speed ----------
@@ -635,6 +644,14 @@ public:
 class MacroPopup;
 static MacroPopup* g_manager = nullptr;
 
+// Tabs, grouped by what they do:
+//   0 Control  - record / play / off, speed
+//   1 Files    - create, save, load, rename, copy, delete, import / export
+//   2 Organize - favourites, tags, folders, sorting
+//   3 Edit     - undo, merge, delete a range of frames
+static char const* const kMgrTabs[] = { "Control", "Files", "Organize", "Edit" };
+static const int kMgrTabCount = 4;
+
 class MacroPopup : public Popup {
 protected:
 	CCLabelBMFont* m_modeLabel = nullptr;
@@ -645,7 +662,13 @@ protected:
 	TextInput* m_input = nullptr;
 	TextInput* m_search = nullptr;
 	ScrollLayer* m_list = nullptr;
+	std::vector<CCNode*> m_tabNodes;
 	float m_listW = 0.f;
+	float m_colW = 0.f;
+	float m_rightX = 0.f;
+	float m_top = 0.f;
+	float m_bs = 0.55f; // button scale
+	int m_tab = 0;
 	bool m_compact = false;
 
 	bool init() {
@@ -668,6 +691,10 @@ protected:
 
 		m_bgSprite->setVisible(false);
 		this->setTitle("Macro Manager");
+
+		// remembered tab: stays the same after closing / re-opening the manager
+		// (including when you come back from the settings popup)
+		m_tab = std::clamp(getInt("mgr-tab", 0), 0, kMgrTabCount - 1);
 
 		auto base = baseColor();
 		auto panel = makePanel(shape, base, { pw, ph });
@@ -694,23 +721,25 @@ protected:
 			}
 		}
 
+		m_bs = m_compact ? 0.45f : 0.55f;
 		float leftX = -pw * 0.23f;
-		float rightX = pw * 0.25f;
+		m_rightX = pw * 0.25f;
+		m_colW = pw * 0.46f;
 		m_listW = pw * 0.44f;
-		float top = ph / 2.f;
-		float listH = ph - 104.f;
-		float listY = -10.f;
+		m_top = ph / 2.f;
+		float listH = ph - 108.f;
+		float listY = -33.f;
 
-		// search + view label
-		m_search = TextInput::create(m_listW, "Search");
+		// ----- left side: search, view info, macro list -----
+		m_search = TextInput::create(m_listW / 0.8f, "Search");
 		m_search->setScale(0.8f);
 		m_search->setString(g_filterText);
 		m_search->setCallback([this](std::string const& s) {
 			g_filterText = s;
 			this->rebuildList();
 		});
-		m_mainLayer->addChildAtPosition(m_search, Anchor::Center, { leftX, top - 36.f });
-		m_viewLabel = addLabel("", leftX, top - 56.f, 0.33f);
+		m_mainLayer->addChildAtPosition(m_search, Anchor::Center, { leftX, m_top - 46.f });
+		m_viewLabel = addLabel("", leftX, m_top - 70.f, 0.33f);
 
 		auto listBg = CCScale9Sprite::create("square02b_001.png", { 0.f, 0.f, 80.f, 80.f });
 		listBg->setColor({ 0, 0, 0 });
@@ -724,82 +753,22 @@ protected:
 		m_list->m_contentLayer->setLayout(ScrollLayer::createDefaultListLayout());
 		m_mainLayer->addChildAtPosition(m_list, Anchor::Center, { leftX, listY });
 
-		float y = top - 42.f;
-		m_modeLabel = addLabel("", rightX, y, 0.6f);
+		// ----- right side: shared text box (hidden on the Control tab) -----
+		m_input = TextInput::create(m_colW / 0.75f, "Name / tag / macro / range");
+		m_input->setScale(0.75f);
+		m_input->setMaxCharCount(24);
+		m_mainLayer->addChildAtPosition(m_input, Anchor::Center, { m_rightX, m_top - 84.f });
 
-		if (m_compact) {
-			y -= 34.f;
-			addBtn("Record", menu_selector(MacroPopup::onRecord), rightX, y, 0.6f);
-			y -= 30.f;
-			addBtn("Play", menu_selector(MacroPopup::onPlay), rightX, y, 0.6f);
-			y -= 30.f;
-			addBtn("Off", menu_selector(MacroPopup::onOff), rightX, y, 0.6f);
-			y -= 28.f;
-			m_selLabel = addLabel("", rightX, y, 0.4f);
-			y -= 30.f;
-			m_speedLabel = addLabel("", rightX, y, 0.5f);
-			y -= 20.f;
-			addSpeedSlider(rightX, y, 0.5f);
-		} else {
-			float s = 0.5f;
-			y -= 22.f;
-			addBtn("Record", menu_selector(MacroPopup::onRecord), rightX - 52.f, y, 0.55f);
-			addBtn("Play", menu_selector(MacroPopup::onPlay), rightX + 4.f, y, 0.55f);
-			addBtn("Off", menu_selector(MacroPopup::onOff), rightX + 52.f, y, 0.55f);
-
-			y -= 20.f;
-			m_selLabel = addLabel("", rightX, y, 0.4f);
-
-			y -= 22.f;
-			m_input = TextInput::create(150.f, "Name / tag / range");
-			m_input->setScale(0.7f);
-			m_input->setMaxCharCount(24);
-			m_mainLayer->addChildAtPosition(m_input, Anchor::Center, { rightX - 35.f, y });
-			addBtn("Rename", menu_selector(MacroPopup::onRename), rightX + 72.f, y, s);
-
-			y -= 22.f;
-			addBtn("Save", menu_selector(MacroPopup::onSave), rightX - 84.f, y, s);
-			addBtn("Load", menu_selector(MacroPopup::onLoad), rightX - 28.f, y, s);
-			addBtn("Delete", menu_selector(MacroPopup::onDelete), rightX + 28.f, y, s);
-			addBtn("New", menu_selector(MacroPopup::onNew), rightX + 84.f, y, s);
-
-			y -= 22.f;
-			addBtn("Copy", menu_selector(MacroPopup::onCopy), rightX - 56.f, y, s);
-			addBtn("Export", menu_selector(MacroPopup::onExport), rightX, y, s);
-			addBtn("Import", menu_selector(MacroPopup::onImport), rightX + 56.f, y, s);
-
-			y -= 22.f;
-			addBtn("Fav", menu_selector(MacroPopup::onFav), rightX - 84.f, y, s);
-			addBtn("Tag", menu_selector(MacroPopup::onTag), rightX - 28.f, y, s);
-			addBtn("Folder", menu_selector(MacroPopup::onFolder), rightX + 28.f, y, s);
-			addBtn("Sort", menu_selector(MacroPopup::onSort), rightX + 84.f, y, s);
-
-			y -= 22.f;
-			addBtn("Undo", menu_selector(MacroPopup::onUndo), rightX - 56.f, y, s);
-			addBtn("Merge", menu_selector(MacroPopup::onMerge), rightX, y, s);
-			addBtn("Del range", menu_selector(MacroPopup::onDelRange), rightX + 58.f, y, s);
-
-			y -= 22.f;
-			m_speedLabel = addLabel("", rightX, y, 0.5f);
-
-			y -= 17.f;
-			addSpeedSlider(rightX, y, 0.55f);
-
-			y -= 20.f;
-			addBtn("0.5x", menu_selector(MacroPopup::onPreset), rightX - 44.f, y, 0.45f)->setTag(50);
-			addBtn("1x", menu_selector(MacroPopup::onPreset), rightX, y, 0.45f)->setTag(100);
-			addBtn("2x", menu_selector(MacroPopup::onPreset), rightX + 44.f, y, 0.45f)->setTag(200);
-		}
-
-		// settings (gear) button
+		// settings (gear) button, top right, level with the title
 		auto gear = CCSprite::createWithSpriteFrameName("GJ_optionsBtn02_001.png");
 		if (gear) {
-			gear->setScale(0.7f);
+			gear->setScale(0.6f);
 			auto gearBtn = CCMenuItemSpriteExtra::create(gear, this, menu_selector(MacroPopup::onSettings));
-			m_buttonMenu->addChildAtPosition(gearBtn, Anchor::TopRight, { -26.f, -26.f });
+			m_buttonMenu->addChildAtPosition(gearBtn, Anchor::TopRight, { -24.f, -24.f });
 		}
 
 		playIntro(panel, opacity);
+		buildTab();
 		rebuildList();
 		refreshLabels();
 		g_manager = this;
@@ -820,12 +789,6 @@ protected:
 		}
 	}
 
-	void addSpeedSlider(float x, float y, float scale) {
-		m_speedSlider = Slider::create(this, menu_selector(MacroPopup::onSpeedSlider), scale);
-		m_speedSlider->setValue(speedToSlider(g_speed));
-		m_mainLayer->addChildAtPosition(m_speedSlider, Anchor::Center, { x, y });
-	}
-
 	static float speedToSlider(float s) {
 		return std::clamp((s - kSpeedMin) / (kSpeedMax - kSpeedMin), 0.f, 1.f);
 	}
@@ -836,6 +799,7 @@ protected:
 		return std::clamp(s, kSpeedMin, kSpeedMax);
 	}
 
+	// permanent label (not removed when switching tabs)
 	CCLabelBMFont* addLabel(char const* text, float x, float y, float scale) {
 		auto label = CCLabelBMFont::create(text, "bigFont.fnt");
 		label->setScale(scale);
@@ -843,10 +807,127 @@ protected:
 		return label;
 	}
 
-	CCMenuItemSpriteExtra* addBtn(char const* text, SEL_MenuHandler cb, float x, float y, float scale) {
-		auto btn = makeButton(text, this, cb, scale);
-		m_buttonMenu->addChildAtPosition(btn, Anchor::Center, { x, y });
+	// label that belongs to the current tab
+	CCLabelBMFont* tabLabel(char const* text, float y, float scale) {
+		auto label = addLabel(text, m_rightX, y, scale);
+		fitLabel(label, m_colW, scale);
+		m_tabNodes.push_back(label);
+		return label;
+	}
+
+	// fixed-width button, so neighbouring buttons can never overlap
+	CCMenuItemSpriteExtra* addCell(char const* text, SEL_MenuHandler cb, float cx, float y, float w, float scale, bool active) {
+		auto spr = ButtonSprite::create(
+			text, static_cast<int>(w / scale), true,
+			"bigFont.fnt", active ? "GJ_button_02.png" : "GJ_button_01.png", 30.f, 0.8f
+		);
+		spr->setScale(scale);
+		if (active) spr->setColor(accentColor());
+		auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
+		m_buttonMenu->addChildAtPosition(btn, Anchor::Center, { cx, y });
+		m_tabNodes.push_back(btn);
 		return btn;
+	}
+
+	// a row of equally sized buttons that exactly fills the right column
+	void addRow(std::vector<std::pair<char const*, SEL_MenuHandler>> const& items, float y) {
+		float gap = 5.f;
+		int n = static_cast<int>(items.size());
+		float w = (m_colW - gap * (n - 1)) / n;
+		for (int i = 0; i < n; i++) {
+			float cx = m_rightX - m_colW / 2.f + w / 2.f + i * (w + gap);
+			addCell(items[i].first, items[i].second, cx, y, w, m_bs, false);
+		}
+	}
+
+	void buildTab() {
+		for (auto n : m_tabNodes) n->removeFromParent();
+		m_tabNodes.clear();
+		m_modeLabel = nullptr;
+		m_selLabel = nullptr;
+		m_speedLabel = nullptr;
+		m_speedSlider = nullptr;
+
+		// tab bar
+		float gap = 4.f;
+		float tw = (m_colW - gap * (kMgrTabCount - 1)) / kMgrTabCount;
+		float tabY = m_top - 56.f;
+		for (int i = 0; i < kMgrTabCount; i++) {
+			float cx = m_rightX - m_colW / 2.f + tw / 2.f + i * (tw + gap);
+			auto b = addCell(kMgrTabs[i], menu_selector(MacroPopup::onTab), cx, tabY, tw, 0.5f, i == m_tab);
+			b->setTag(i);
+		}
+
+		bool showInput = m_tab != 0;
+		if (m_input) {
+			m_input->setVisible(showInput);
+			m_input->setEnabled(showInput);
+		}
+
+		float rowY = m_top - 112.f;
+		float step = 30.f;
+
+		if (m_tab == 0) {
+			// Control
+			m_modeLabel = tabLabel("", m_top - 86.f, 0.55f);
+			addRow({
+				{ "Record", menu_selector(MacroPopup::onRecord) },
+				{ "Play", menu_selector(MacroPopup::onPlay) },
+				{ "Off", menu_selector(MacroPopup::onOff) },
+			}, rowY);
+			m_selLabel = tabLabel("", rowY - 28.f, 0.4f);
+			m_speedLabel = tabLabel("", rowY - 56.f, 0.5f);
+
+			m_speedSlider = Slider::create(this, menu_selector(MacroPopup::onSpeedSlider), 0.7f);
+			m_speedSlider->setValue(speedToSlider(g_speed));
+			m_mainLayer->addChildAtPosition(m_speedSlider, Anchor::Center, { m_rightX, rowY - 76.f });
+			m_tabNodes.push_back(m_speedSlider);
+
+			float pg = 5.f;
+			float pwid = (m_colW - pg * 2.f) / 3.f;
+			float px = m_rightX - m_colW / 2.f + pwid / 2.f;
+			addCell("0.5x", menu_selector(MacroPopup::onPreset), px, rowY - 102.f, pwid, 0.45f, false)->setTag(50);
+			addCell("1x", menu_selector(MacroPopup::onPreset), px + (pwid + pg), rowY - 102.f, pwid, 0.45f, false)->setTag(100);
+			addCell("2x", menu_selector(MacroPopup::onPreset), px + (pwid + pg) * 2.f, rowY - 102.f, pwid, 0.45f, false)->setTag(200);
+		} else if (m_tab == 1) {
+			// Files
+			addRow({
+				{ "New", menu_selector(MacroPopup::onNew) },
+				{ "Save", menu_selector(MacroPopup::onSave) },
+				{ "Load", menu_selector(MacroPopup::onLoad) },
+				{ "Delete", menu_selector(MacroPopup::onDelete) },
+			}, rowY);
+			addRow({
+				{ "Rename", menu_selector(MacroPopup::onRename) },
+				{ "Copy", menu_selector(MacroPopup::onCopy) },
+			}, rowY - step);
+			addRow({
+				{ "Export", menu_selector(MacroPopup::onExport) },
+				{ "Import", menu_selector(MacroPopup::onImport) },
+			}, rowY - step * 2.f);
+			tabLabel("Type a name, then tap Rename", rowY - step * 3.f + 6.f, 0.3f);
+			tabLabel("Export / Import use the clipboard", rowY - step * 3.f - 8.f, 0.3f);
+		} else if (m_tab == 2) {
+			// Organize
+			addRow({
+				{ "Fav", menu_selector(MacroPopup::onFav) },
+				{ "Tag", menu_selector(MacroPopup::onTag) },
+				{ "Folder", menu_selector(MacroPopup::onFolder) },
+				{ "Sort", menu_selector(MacroPopup::onSort) },
+			}, rowY);
+			tabLabel("Type a tag name, then tap Tag", rowY - step + 6.f, 0.3f);
+			tabLabel("Folder cycles through your tags", rowY - step - 8.f, 0.3f);
+		} else {
+			// Edit
+			addRow({
+				{ "Undo", menu_selector(MacroPopup::onUndo) },
+				{ "Merge", menu_selector(MacroPopup::onMerge) },
+				{ "Del range", menu_selector(MacroPopup::onDelRange) },
+			}, rowY);
+			tabLabel("Merge: type the macro to append", rowY - step + 6.f, 0.3f);
+			tabLabel("Del range: type frames like 100-500", rowY - step - 8.f, 0.3f);
+			tabLabel("Tap Save (Files tab) to keep edits", rowY - step - 22.f, 0.3f);
+		}
 	}
 
 	void rebuildList() {
@@ -936,20 +1017,29 @@ protected:
 		std::string f = g_folder.empty() ? "All" : g_folder;
 		std::string s = std::string("Sort: ") + kSortNames[sort] + "  Folder: " + f;
 		m_viewLabel->setString(s.c_str());
+		fitLabel(m_viewLabel, m_listW, 0.33f);
 	}
 
 	void refreshLabels() {
-		char const* modes[] = { "Mode: Off", "Mode: Recording", "Mode: Playing" };
-		m_modeLabel->setString(modes[g_mode]);
+		if (m_modeLabel) {
+			char const* modes[] = { "Mode: Off", "Mode: Recording", "Mode: Playing" };
+			m_modeLabel->setString(modes[g_mode]);
+			fitLabel(m_modeLabel, m_colW, 0.55f);
+		}
 
-		std::string shown = g_selected;
-		if (shown.size() > 18) shown = shown.substr(0, 17) + "...";
-		std::string sel = g_selected.empty() ? "Selected: none" : "Selected: " + shown;
-		m_selLabel->setString(sel.c_str());
+		if (m_selLabel) {
+			std::string shown = g_selected;
+			if (shown.size() > 18) shown = shown.substr(0, 17) + "...";
+			std::string sel = g_selected.empty() ? "Selected: none" : "Selected: " + shown;
+			m_selLabel->setString(sel.c_str());
+			fitLabel(m_selLabel, m_colW, 0.4f);
+		}
 
-		char buf[32];
-		std::snprintf(buf, sizeof(buf), "Speed %.2fx", g_speed);
-		m_speedLabel->setString(buf);
+		if (m_speedLabel) {
+			char buf[32];
+			std::snprintf(buf, sizeof(buf), "Speed %.2fx", g_speed);
+			m_speedLabel->setString(buf);
+		}
 	}
 
 	void notify(char const* text) {
@@ -958,6 +1048,15 @@ protected:
 
 	std::string inputText() {
 		return m_input ? std::string(m_input->getString()) : std::string();
+	}
+
+	void onTab(CCObject* sender) {
+		int t = static_cast<CCNode*>(sender)->getTag();
+		if (t == m_tab) return;
+		m_tab = std::clamp(t, 0, kMgrTabCount - 1);
+		setInt("mgr-tab", m_tab);
+		buildTab();
+		refreshLabels();
 	}
 
 	void onPick(CCObject* sender) {
@@ -1227,7 +1326,7 @@ protected:
 	void onPreset(CCObject* sender) {
 		g_speed = static_cast<CCNode*>(sender)->getTag() / 100.f;
 		applySpeed();
-		m_speedSlider->setValue(speedToSlider(g_speed));
+		if (m_speedSlider) m_speedSlider->setValue(speedToSlider(g_speed));
 		refreshLabels();
 	}
 
@@ -1271,6 +1370,9 @@ protected:
 
 		for (int i = 0; i < kSettingCount; i++) m_vals[i] = getSetting(i);
 
+		// remembered page: the settings popup re-opens on the page you left it on
+		m_page = std::clamp(getInt("set-page", 0), 0, kPageCount - 1);
+
 		// profiles
 		auto pPrev = makeButton("<", this, menu_selector(SettingsPopup::onProfPrev), 0.5f);
 		m_buttonMenu->addChildAtPosition(pPrev, Anchor::Center, { -150.f, -68.f });
@@ -1280,9 +1382,9 @@ protected:
 		auto pNext = makeButton(">", this, menu_selector(SettingsPopup::onProfNext), 0.5f);
 		m_buttonMenu->addChildAtPosition(pNext, Anchor::Center, { -60.f, -68.f });
 		auto pSave = makeButton("Save", this, menu_selector(SettingsPopup::onProfSave), 0.55f);
-		m_buttonMenu->addChildAtPosition(pSave, Anchor::Center, { -10.f, -68.f });
+		m_buttonMenu->addChildAtPosition(pSave, Anchor::Center, { -5.f, -68.f });
 		auto pLoad = makeButton("Load", this, menu_selector(SettingsPopup::onProfLoad), 0.55f);
-		m_buttonMenu->addChildAtPosition(pLoad, Anchor::Center, { 40.f, -68.f });
+		m_buttonMenu->addChildAtPosition(pLoad, Anchor::Center, { 50.f, -68.f });
 
 		// page nav + apply
 		auto prev = makeButton("<", this, menu_selector(SettingsPopup::onPagePrev), 0.7f);
@@ -1316,6 +1418,11 @@ protected:
 		return buf;
 	}
 
+	void setValueLabel(CCLabelBMFont* label, int idx) {
+		label->setString(valueText(idx).c_str());
+		fitLabel(label, 100.f, 0.45f);
+	}
+
 	void updateProfLabel() {
 		char buf[24];
 		std::snprintf(buf, sizeof(buf), "Profile %d", m_profile);
@@ -1339,8 +1446,8 @@ protected:
 			float y = 72.f - r * 36.f;
 
 			auto title = CCLabelBMFont::create(kSettings[idx].label, "bigFont.fnt");
-			title->setScale(0.4f);
 			title->setAnchorPoint({ 0.f, 0.5f });
+			fitLabel(title, 100.f, 0.4f);
 			m_mainLayer->addChildAtPosition(title, Anchor::Center, { -160.f, y });
 			m_pageNodes.push_back(title);
 
@@ -1360,7 +1467,7 @@ protected:
 			m_buttonMenu->addChildAtPosition(plus, Anchor::Center, { 75.f, y });
 			m_pageNodes.push_back(plus);
 
-			value->setString(valueText(idx).c_str());
+			setValueLabel(value, idx);
 		}
 		refreshPreview();
 	}
@@ -1380,7 +1487,7 @@ protected:
 		}
 		m_preview = makePanel(val("ui-shape"), c, { 60.f, 46.f });
 		m_preview->setOpacity(static_cast<GLubyte>(255 * val("ui-opacity") / 100));
-		m_mainLayer->addChildAtPosition(m_preview, Anchor::Center, { 130.f, 20.f });
+		m_mainLayer->addChildAtPosition(m_preview, Anchor::Center, { 135.f, 20.f });
 	}
 
 	void applyTheme(int t) {
@@ -1413,18 +1520,20 @@ protected:
 
 		int row = idx - m_page * kRowsPerPage;
 		if (row >= 0 && row < static_cast<int>(m_valueLabels.size())) {
-			m_valueLabels[row]->setString(valueText(idx).c_str());
+			setValueLabel(m_valueLabels[row], idx);
 		}
 		refreshPreview();
 	}
 
 	void onPagePrev(CCObject*) {
 		m_page = (m_page + kPageCount - 1) % kPageCount;
+		setInt("set-page", m_page);
 		buildPage();
 	}
 
 	void onPageNext(CCObject*) {
 		m_page = (m_page + 1) % kPageCount;
+		setInt("set-page", m_page);
 		buildPage();
 	}
 
@@ -1467,6 +1576,7 @@ protected:
 	void onApply(CCObject*) {
 		for (int i = 0; i < kSettingCount; i++) setInt(kSettings[i].key, m_vals[i]);
 
+		// the manager re-opens on the same tab (saved as "mgr-tab")
 		auto old = g_manager;
 		if (old) old->closeManager();
 		if (auto popup = MacroPopup::create()) popup->show();

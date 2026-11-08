@@ -35,12 +35,13 @@ static int g_corrections = 0;
 static bool g_injecting = false;
 static float g_speed = 1.f;
 static bool g_speedTouched = false; // true once the user changed speed
+static bool g_anchorsOn = true;
 static std::string g_selected;
 
 static constexpr float kSpeedMin = 0.1f;
 static constexpr float kSpeedMax = 5.f;
 static constexpr int kAnchorEvery = 20;     // frames between anchors
-static constexpr float kAnchorTol = 0.25f;  // units of drift before correcting
+static constexpr float kAnchorTol = 2.f;    // only correct large drift
 
 // ---------- theme settings ----------
 
@@ -351,6 +352,7 @@ protected:
 	CCLabelBMFont* m_selLabel = nullptr;
 	CCLabelBMFont* m_speedLabel = nullptr;
 	Slider* m_speedSlider = nullptr;
+	ButtonSprite* m_anchorSpr = nullptr;
 	TextInput* m_input = nullptr;
 	ScrollLayer* m_list = nullptr;
 	float m_listW = 0.f;
@@ -426,6 +428,13 @@ protected:
 		m_speedSlider = Slider::create(this, menu_selector(MacroPopup::onSpeedSlider), 0.6f);
 		m_speedSlider->setValue(speedToSlider(g_speed));
 		m_mainLayer->addChildAtPosition(m_speedSlider, Anchor::Center, { rightX, y });
+
+		// anchors on/off toggle
+		y -= 30.f;
+		m_anchorSpr = ButtonSprite::create(g_anchorsOn ? "Anchors: On" : "Anchors: Off");
+		m_anchorSpr->setScale(0.6f);
+		auto anchorBtn = CCMenuItemSpriteExtra::create(m_anchorSpr, this, menu_selector(MacroPopup::onToggleAnchors));
+		m_buttonMenu->addChildAtPosition(anchorBtn, Anchor::Center, { rightX, y });
 
 		// settings (gear) button, top-right of the panel
 		auto gear = CCSprite::createWithSpriteFrameName("GJ_optionsBtn02_001.png");
@@ -619,6 +628,11 @@ protected:
 		refreshLabels();
 	}
 
+	void onToggleAnchors(CCObject*) {
+		g_anchorsOn = !g_anchorsOn;
+		m_anchorSpr->setString(g_anchorsOn ? "Anchors: On" : "Anchors: Off");
+	}
+
 	void onCustomize(CCObject*);
 
 public:
@@ -777,13 +791,13 @@ class $modify(GJBaseGameLayer) {
 	}
 
 	// Snap a player back to the anchor if it has drifted too far.
+	// Position only: velocity is left alone so clicks keep working.
 	void alignPlayer(PlayerObject* p, float x, float y, float v) {
-		if (!p) return;
+		if (!p || !g_anchorsOn) return;
 		float dx = p->getPositionX() - x;
 		float dy = p->getPositionY() - y;
 		if (std::fabs(dx) > kAnchorTol || std::fabs(dy) > kAnchorTol) {
 			p->setPosition({ x, y });
-			p->m_yVelocity = v;
 			g_corrections++;
 		}
 	}

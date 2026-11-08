@@ -19,12 +19,12 @@ class $modify(GJBaseGameLayer) {
 		GJBaseGameLayer::handleButton(down, button, p1);
 	}
 
-	void processCommands(float dt) {
+		void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		if (g_mode == 2) {
 			while (g_cursor < g_inputs.size() && g_inputs[g_cursor].frame <= m_gameState.m_currentProgress) {
 				auto& i = g_inputs[g_cursor++];
 				g_injecting = true;
-				GJBaseGameLayer::handleButton(i.down, i.button, i.p1);
+				GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 				g_injecting = false;
 			}
 		}

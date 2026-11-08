@@ -48,6 +48,10 @@ static std::string g_folder; // "" = all, "(none)" = untagged
 static bool g_pathDirty = true;
 static size_t g_pathKey = static_cast<size_t>(-1);
 
+// solver diagnostics: where the player last died while solving
+static int g_solDeathFrame = -1;
+static float g_solDeathX = 0.f;
+
 // ---------- frame windows ----------
 // For every click (input index) the number of frames it can be pressed
 // earlier / later and still survive. Saved in the macro file as "W" lines.
@@ -765,7 +769,11 @@ static void solFinish(int code) {
 	if (have && code != -1 && !g_selected.empty()) writeMacro(g_selected);
 	if (code == 0) showSavedBox("Route found: " + std::to_string(g_inputs.size()) + " inputs, saved");
 	else if (code == 3) showSavedBox("Solver stopped. Partial route saved");
-	else if (code == -1) showSavedBox("No route found");
+	else if (code == -1) showSavedBox(
+		"No route. Last death: frame " + std::to_string(g_solDeathFrame) +
+		", x " + std::to_string(static_cast<int>(g_solDeathX)) +
+		", tries " + std::to_string(g_sol.attempts)
+	);
 	else if (code == -2) showSavedBox("Solver hit the try limit. Partial route saved");
 	else showSavedBox("Solver lost sync with the level");
 }
@@ -1644,6 +1652,8 @@ protected:
 		g_selected = nextMacroName();
 		g_cursor = 0;
 		g_anchorCursor = 0;
+		g_solDeathFrame = -1;
+		g_solDeathX = 0.f;
 		g_mode = 4;
 		notify("Solver: restart the level");
 		this->keyBackClicked();
@@ -2341,6 +2351,9 @@ class $modify(PlayLayer) {
 		}
 		if (g_mode == 4 && g_sol.active && !g_sol.resolved) {
 			this->stopActionByTag(0x10);
+			// remember where the death happened (shown if the solver gives up)
+			g_solDeathFrame = g_frame;
+			g_solDeathX = m_player1 ? m_player1->getPositionX() : 0.f;
 			// dying inside the replayed part of the route means we lost sync
 			solResolve(g_frame < g_sol.frame ? 2 : 0);
 		}

@@ -50,6 +50,23 @@ static std::string g_folder; // "" = all, "(none)" = untagged
 static bool g_pathDirty = true;
 static size_t g_pathKey = static_cast<size_t>(-1);
 
+// step-exact recording: inputs are stamped with the step counter read at the START of
+// processCommands (the same point playback injects them), not whatever the counter is when
+// handleButton happens to run. Inputs that arrive outside processCommands are stamped with
+// the step of the next processCommands call, which is the step that really applies them.
+static bool g_inCmd = false;
+static std::vector<size_t> g_pendStamp;
+
+// divergence finder: where playback first stops matching the recording
+static int g_divFrame = -1;     // first frame that differs by more than the limit (-1 = none yet)
+static float g_divDx = 0.f;     // offset at that frame (live - recorded)
+static float g_divDy = 0.f;
+static int g_divWhich = 1;      // which player it was (1 or 2)
+static int g_divCount = 0;      // how many checked frames were off
+static int g_divChecked = 0;    // how many frames were compared
+static float g_divMax = 0.f;    // biggest offset seen
+static bool g_divReported = false;
+
 // solver diagnostics: where the player last died while solving
 static int g_solDeathFrame = -1;
 static float g_solDeathX = 0.f;
@@ -100,6 +117,8 @@ struct WinTest {
 	bool pendingAdvance = false;
 	int sp = -1;         // save point used by the current attempt (-1 = none)
 	bool spOk = true;    // false once save points proved unreliable for this test
+	int maxE = 0;        // most frames this click can move earlier without crossing the previous release
+	int maxL = 0;        // most frames this click (and its release) can move later without crossing the next press
 };
 static WinTest g_wt;
 static std::vector<MacroInput> g_work; // macro with the tested click shifted
@@ -260,12 +279,17 @@ static const SettingDef kSettings[] = {
 	{ "win-gap", "Save gap", 60, 300, 20, 120, nullptr, 1, "f" },
 	{ "win-speed", "Test speed", 1, 10, 1, 4, nullptr, 1, "x" },
 	{ "pitch", "Audio pitch", 0, 1, 1, 1, kOffOn, 1, "" },
+	// page 13: accuracy
+	{ "step-rec", "Step-exact rec", 0, 1, 1, 1, kOffOn, 1, "" },
+	{ "div-find", "Desync finder", 0, 1, 1, 1, kOffOn, 1, "" },
+	{ "div-tol", "Desync limit", 1, 50, 1, 5, nullptr, 1, "/100" },
+	{ "snap", "Snap to route", 0, 1, 1, 1, kOffOn, 1, "" },
 };
-static const int kSettingCount = 52;
+static const int kSettingCount = 56;
 static const int kRowsPerPage = 4;
-static const int kPageCount = 13;
+static const int kPageCount = 14;
 static char const* const kPageTitles[] = {
-	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder", "Window", "Route", "Solver / Window", "Test run"
+	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder", "Window", "Route", "Solver / Window", "Test run", "Accuracy"
 };
 
 struct ThemeVal { char const* key; int val; };
@@ -728,9 +752,72 @@ static void wtBuildWork() {
 	std::stable_sort(g_work.begin(), g_work.end(), [](MacroInput const& a, MacroInput const& b) {
 		return a.frame < b.frame;
 	});
-	// survive for a while after the click, but never past where the macro
-	// itself dies (that is the latest point we can judge)
-	g_wt.endFrame = std::min(clickFrame + S("win-after"), g_wt.baseEnd);
+	// Survive for at least "win-after" frames, and also through the next two presses
+	// of the original macro (a shifted click can set up a death a few clicks later).
+	// Never past where the macro itself dies (the latest point we can judge).
+	int need = clickFrame + S("win-after");
+	int seen = 0;
+	int origFrame = g_inputs[idx].frame;
+	for (size_t j = idx + 1; j < g_inputs.size() && seen < 2; j++) {
+		if (g_inputs[j].down && g_inputs[j].frame > origFrame) {
+			seen++;
+			if (seen == 2) need = std::max(need, g_inputs[j].frame + 10);
+		}
+	}
+	if (seen < 2 && !g_inputs.empty()) need = std::max(need, g_inputs.back().frame + 10);
+	g_wt.endFrame = std::min(need, g_wt.baseEnd);
+}
+
+// How far the click at input index idx can be moved without crossing a neighbouring input
+// of the same button. Moving past the previous release (or the next press) would change the
+// order of inputs and test a macro that is not "the same macro, shifted", which gave wrong windows.
+static void wtLimits(int idx, int& maxE, int& maxL) {
+	auto& c = g_inputs[idx];
+	int prevRel = -1;
+	for (int j = idx - 1; j >= 0; j--) {
+		if (g_inputs[j].button == c.button && g_inputs[j].p1 == c.p1 && !g_inputs[j].down) {
+			prevRel = g_inputs[j].frame;
+			break;
+		}
+	}
+	maxE = (prevRel < 0) ? c.frame : (c.frame - prevRel - 1);
+	maxL = 0x7fffffff;
+	int rel = -1;
+	for (size_t j = static_cast<size_t>(idx) + 1; j < g_inputs.size(); j++) {
+		if (g_inputs[j].button == c.button && g_inputs[j].p1 == c.p1 && !g_inputs[j].down) { rel = static_cast<int>(j); break; }
+	}
+	if (rel >= 0) {
+		for (size_t j = static_cast<size_t>(rel) + 1; j < g_inputs.size(); j++) {
+			if (g_inputs[j].button == c.button && g_inputs[j].p1 == c.p1 && g_inputs[j].down) {
+				maxL = g_inputs[j].frame - g_inputs[rel].frame - 1;
+				break;
+			}
+		}
+	}
+	maxE = std::max(0, maxE);
+	maxL = std::max(0, maxL);
+}
+
+// Starts testing the click at g_wt.ci (skipping clicks that cannot move at all).
+// 1 = a test is set up, 0 = every click is done
+static int wtBeginClick() {
+	while (g_wt.ci < g_wt.clicks.size()) {
+		int idx = g_wt.clicks[g_wt.ci];
+		wtLimits(idx, g_wt.maxE, g_wt.maxL);
+		g_wt.early = 0;
+		g_wt.late = 0;
+		if (g_wt.maxE >= 1) { g_wt.phase = 1; g_wt.s = 1; return 1; }
+		if (g_wt.maxL >= 1) { g_wt.phase = 2; g_wt.s = 1; return 1; }
+		g_windows[idx] = { 0, 0 };
+		g_wt.ci++;
+	}
+	return 0;
+}
+
+static int wtFinishClick() {
+	g_windows[g_wt.clicks[g_wt.ci]] = { g_wt.early, g_wt.late };
+	g_wt.ci++;
+	return wtBeginClick();
 }
 
 // 1 = keep testing, 0 = finished, -1 = macro does not finish on its own
@@ -747,31 +834,19 @@ static int wtAdvance() {
 		g_wt.clicks = keep;
 		if (g_wt.clicks.empty()) return -1;
 		g_wt.ci = 0;
-		g_wt.phase = 1;
-		g_wt.s = 1;
-		g_wt.early = 0;
-		g_wt.late = 0;
-		return 1;
+		return wtBeginClick();
 	}
 	if (g_wt.phase == 1) {
 		if (g_wt.lastOk) g_wt.early = g_wt.s;
-		if (g_wt.lastOk && g_wt.s < maxS) { g_wt.s++; return 1; }
-		g_wt.phase = 2;
-		g_wt.s = 1;
-		return 1;
+		if (g_wt.lastOk && g_wt.s < std::min(maxS, g_wt.maxE)) { g_wt.s++; return 1; }
+		if (g_wt.maxL >= 1) { g_wt.phase = 2; g_wt.s = 1; return 1; }
+		return wtFinishClick();
 	}
 	int clickIdx = g_wt.clicks[g_wt.ci];
 	bool lateOk = g_wt.lastOk && g_inputs[clickIdx].frame + g_wt.s < g_wt.baseEnd;
 	if (lateOk) g_wt.late = g_wt.s;
-	if (lateOk && g_wt.s < maxS) { g_wt.s++; return 1; }
-	g_windows[clickIdx] = { g_wt.early, g_wt.late };
-	g_wt.ci++;
-	if (g_wt.ci >= g_wt.clicks.size()) return 0;
-	g_wt.phase = 1;
-	g_wt.s = 1;
-	g_wt.early = 0;
-	g_wt.late = 0;
-	return 1;
+	if (lateOk && g_wt.s < std::min(maxS, g_wt.maxL)) { g_wt.s++; return 1; }
+	return wtFinishClick();
 }
 
 static void wtFinish(bool aborted) {
@@ -2141,6 +2216,37 @@ void MacroPopup::onSettings(CCObject*) {
 	if (auto popup = SettingsPopup::create()) popup->show();
 }
 
+// Compares the live player with the recorded spot. Called BEFORE any correction is applied,
+// so with "Snap to route" off this shows the true drift of the replay.
+static void divCheck(PlayerObject* p, int frame, float x, float y, int which) {
+	if (!p) return;
+	float dx = static_cast<float>(p->getPositionX()) - x;
+	float dy = static_cast<float>(p->getPositionY()) - y;
+	float err = std::max(std::fabs(dx), std::fabs(dy));
+	g_divChecked++;
+	if (err > g_divMax) g_divMax = err;
+	if (err > S("div-tol") * 0.01f) {
+		g_divCount++;
+		if (g_divFrame < 0) {
+			g_divFrame = frame;
+			g_divDx = dx;
+			g_divDy = dy;
+			g_divWhich = which;
+		}
+	}
+}
+
+static void divReset() {
+	g_divFrame = -1;
+	g_divDx = 0.f;
+	g_divDy = 0.f;
+	g_divWhich = 1;
+	g_divCount = 0;
+	g_divChecked = 0;
+	g_divMax = 0.f;
+	g_divReported = false;
+}
+
 // ---------- hooks ----------
 
 class $modify(GJBaseGameLayer) {
@@ -2388,6 +2494,12 @@ class $modify(GJBaseGameLayer) {
 		std::string text = g_mode == 1 ? "REC" : (g_mode == 2 ? "PLAY" : (g_mode == 3 ? "TEST" : (g_mode == 4 ? "SOLVE" : "IDLE")));
 		if (S("hud-frame")) text += "\nFrame " + std::to_string(g_frame);
 		if (S("hud-corr") && g_mode == 2) text += "\nFixes " + std::to_string(g_corrections);
+		if (S("div-find") && g_mode == 2) {
+			char db[64];
+			if (g_divFrame >= 0) std::snprintf(db, sizeof(db), "\nDESYNC f%d %.2f/%.2f", g_divFrame, g_divDx, g_divDy);
+			else std::snprintf(db, sizeof(db), "\nSync ok (max %.2f)", g_divMax);
+			text += db;
+		}
 		if (S("counter") && g_mode == 1) {
 			int clicks = 0, releases = 0;
 			for (auto& i : g_inputs) {
@@ -2466,11 +2578,15 @@ class $modify(GJBaseGameLayer) {
 		if ((g_mode == 2 || g_mode == 3 || g_mode == 4) && !g_injecting) return;
 		if (g_mode == 1) {
 			MacroInput in;
-			in.frame = static_cast<int>(m_gameState.m_currentProgress);
+			bool exact = S("step-rec") != 0;
+			// step-exact: use the step read at the start of processCommands
+			in.frame = exact ? g_frame : static_cast<int>(m_gameState.m_currentProgress);
 			in.button = static_cast<int>(button);
 			in.down = down;
 			in.p1 = p1;
 			g_inputs.push_back(in);
+			// arrived outside processCommands: it is applied on the next step, so stamp it then
+			if (exact && !g_inCmd) g_pendStamp.push_back(g_inputs.size() - 1);
 		}
 		GJBaseGameLayer::handleButton(down, button, p1);
 	}
@@ -2516,6 +2632,9 @@ class $modify(GJBaseGameLayer) {
 	// Position only: velocity is left alone so clicks keep working.
 	void alignPlayer(PlayerObject* p, float x, float y, float v) {
 		if (!p) return;
+		// "Snap to route" off: playback is left alone so the finder shows real drift
+		// (the solver always needs the snapping)
+		if (g_mode != 4 && !S("snap")) return;
 		if (S("exact-route") || g_mode == 4) {
 			// exact route: put the player on the recorded spot every frame
 			float ex = p->getPositionX() - x;
@@ -2541,6 +2660,10 @@ class $modify(GJBaseGameLayer) {
 		while (g_anchorCursor < g_anchors.size() && g_anchors[g_anchorCursor].frame <= frame) {
 			auto& a = g_anchors[g_anchorCursor++];
 			if (a.frame != frame) continue;
+			if (g_mode == 2 && S("div-find")) {
+				divCheck(m_player1, frame, a.x1, a.y1, 1);
+				if (a.dual && m_gameState.m_isDualMode) divCheck(m_player2, frame, a.x2, a.y2, 2);
+			}
 			alignPlayer(m_player1, a.x1, a.y1, a.v1);
 			if (a.dual && m_gameState.m_isDualMode) alignPlayer(m_player2, a.x2, a.y2, a.v2);
 		}
@@ -2569,6 +2692,12 @@ class $modify(GJBaseGameLayer) {
 			frame += g_frameBase;
 		}
 		g_frame = frame;
+		if (g_mode == 1 && !g_pendStamp.empty()) {
+			for (auto idx : g_pendStamp) {
+				if (idx < g_inputs.size()) g_inputs[idx].frame = frame;
+			}
+			g_pendStamp.clear();
+		}
 		if (g_diagPending && m_player1) {
 			g_diagPending = false;
 			char b[200];
@@ -2602,7 +2731,7 @@ class $modify(GJBaseGameLayer) {
 				g_spVerify--;
 				if (frame >= 0 && static_cast<size_t>(frame) < g_baseTrace.size()) {
 					auto& tr = g_baseTrace[frame];
-					if (tr[0] < 1e8f && (std::fabs(px - tr[0]) > 0.05f || std::fabs(py - tr[1]) > 0.05f)) spFail();
+					if (tr[0] < 1e8f && (std::fabs(px - tr[0]) > 0.02f || std::fabs(py - tr[1]) > 0.02f)) spFail();
 				}
 			}
 		}
@@ -2637,7 +2766,9 @@ class $modify(GJBaseGameLayer) {
 				else if (frame >= g_sol.frame) recordSolAnchor(frame);
 			}
 		}
+		g_inCmd = true;
 		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+		g_inCmd = false;
 	}
 };
 
@@ -2679,6 +2810,8 @@ class $modify(PlayLayer) {
 		g_lastAnchorFrame = -1;
 		g_corrections = 0;
 		g_pathDirty = true;
+		g_pendStamp.clear();
+		if (g_mode == 2) divReset();
 		g_diagPending = (g_mode == 3 || g_mode == 4);
 		if (m_objectLayer) {
 			if (auto rr = m_objectLayer->getChildByID("macro-rings")) rr->removeAllChildrenWithCleanup(true);
@@ -2712,7 +2845,7 @@ class $modify(PlayLayer) {
 						g_wt.sp = best;
 						g_spNeedBase = true;
 						g_spExpect = g_sps[best].frame;
-						g_spVerify = 10;
+						g_spVerify = 20;
 						while (g_cursor < g_work.size() && g_work[g_cursor].frame < g_spExpect) g_cursor++;
 					}
 				}
@@ -2744,6 +2877,18 @@ class $modify(PlayLayer) {
 			return;
 		}
 		PlayLayer::destroyPlayer(player, object);
+		if (g_mode == 2 && S("div-find") && !g_divReported) {
+			g_divReported = true;
+			std::string msg = "Died at frame " + std::to_string(g_frame);
+			char b[128];
+			if (g_divFrame >= 0) {
+				std::snprintf(b, sizeof(b), "\nFirst desync: frame %d, player %d, dx %.2f dy %.2f (%d frames off)",
+					g_divFrame, g_divWhich, g_divDx, g_divDy, g_divCount);
+			} else {
+				std::snprintf(b, sizeof(b), "\nNo desync before death (max offset %.3f)", g_divMax);
+			}
+			showSavedBox(msg + b);
+		}
 		{
 			bool fresh = (g_mode == 3) ? (g_wt.active && !g_wt.resolved) : (g_mode == 4 && g_sol.active && !g_sol.resolved);
 			if (fresh && m_player1) {
@@ -2812,8 +2957,19 @@ class $modify(PlayLayer) {
 				this->resetLevel();
 				return;
 			}
-			if (g_corrections > 0) {
-				showSavedBox("Playback done (" + std::to_string(g_corrections) + " corrections)");
+			if (g_corrections > 0 || g_divFrame >= 0) {
+				std::string m = "Playback done (" + std::to_string(g_corrections) + " corrections)";
+				if (S("div-find")) {
+					char b[128];
+					if (g_divFrame >= 0) {
+						std::snprintf(b, sizeof(b), "\nFirst desync: frame %d, dx %.2f dy %.2f (%d frames off)",
+							g_divFrame, g_divDx, g_divDy, g_divCount);
+					} else {
+						std::snprintf(b, sizeof(b), "\nNo desync found (max offset %.3f)", g_divMax);
+					}
+					m += b;
+				}
+				showSavedBox(m);
 			}
 			g_mode = 0;
 		}

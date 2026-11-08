@@ -71,6 +71,33 @@ struct WinTest {
 static WinTest g_wt;
 static std::vector<MacroInput> g_work; // macro with the tested click shifted
 
+// ---------- auto solver ----------
+// Builds a macro by itself, one chunk of frames at a time. The route found so
+// far is replayed exactly (positions + clicks); past its end the solver tries
+// click patterns. A chunk that survives is kept, a chunk that dies tries the
+// next pattern, and when every pattern fails it backs up one chunk.
+struct SolFrame { size_t inputCount; size_t anchorCount; int frame; int tried; };
+struct Solver {
+	bool active = false;
+	int chunk = 12;
+	int frame = 0;        // end of the proven route
+	int k = 0;            // pattern being tried
+	int attempts = 0;
+	int maxAttempts = 5000;
+	int desync = 0;
+	bool holding = false; // hold state at the end of the proven route
+	std::vector<SolFrame> stack;
+	std::vector<MacroAnchor> tmpAn;
+	bool resolved = false;
+	int result = 0;       // 0 died, 1 survived the chunk, 2 lost sync
+	bool pendingReset = false;
+	bool pendingAdvance = false;
+	float savedSpeed = 1.f;
+	bool savedTouched = false;
+};
+static Solver g_sol;
+static const int kSolCands = 13;
+
 static constexpr float kSpeedMin = 0.1f;
 static constexpr float kSpeedMax = 5.f;
 
@@ -184,12 +211,17 @@ static const SettingDef kSettings[] = {
 	// page 10: exact route
 	{ "exact-route", "Exact route", 0, 1, 1, 1, kOffOn, 1, "" },
 	{ "route-vel", "Restore speed", 0, 1, 1, 1, kOffOn, 1, "" },
+	{ "solve-chunk", "Solve chunk", 6, 40, 2, 12, nullptr, 1, "f" },
+	{ "solve-speed", "Solve speed", 1, 10, 1, 4, nullptr, 1, "x" },
+	// page 11: auto solver
+	{ "solve-tries", "Max tries", 500, 20000, 500, 5000, nullptr, 1, "" },
+	{ "solve-tap", "Tap length", 2, 10, 1, 3, nullptr, 1, "f" },
 };
-static const int kSettingCount = 42;
+static const int kSettingCount = 46;
 static const int kRowsPerPage = 4;
-static const int kPageCount = 11;
+static const int kPageCount = 12;
 static char const* const kPageTitles[] = {
-	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder", "Window", "Route"
+	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder", "Window", "Route", "Solver"
 };
 
 struct ThemeVal { char const* key; int val; };
@@ -602,6 +634,121 @@ static void wtFinish(bool aborted) {
 	showSavedBox("Window test done and saved");
 }
 
+// ---------- solver engine ----------
+
+// Click pattern number k, as (frame offset inside the chunk, button down?).
+static std::vector<std::pair<int, bool>> solCandidate(int k) {
+	int C = g_sol.chunk;
+	bool hold = g_sol.holding;
+	int offs[4] = { 0, C / 2, C / 4, (C * 3) / 4 };
+	std::vector<std::pair<int, bool>> ev;
+	if (k <= 0) return ev;
+	if (k <= 4) {
+		ev.push_back({ offs[k - 1], !hold });
+		return ev;
+	}
+	int j = std::clamp(k - 5, 0, 7);
+	int o = offs[j / 2];
+	int tap = S("solve-tap");
+	int w = (j % 2 == 0) ? tap : tap * 2;
+	int o2 = std::min(o + w, C - 1);
+	if (o2 <= o) o2 = o + 1;
+	ev.push_back({ o, !hold });
+	ev.push_back({ o2, hold });
+	return ev;
+}
+
+static void solRecomputeHold() {
+	bool h = false;
+	for (auto& i : g_inputs) {
+		if (i.p1 && i.button == 1) h = i.down;
+	}
+	g_sol.holding = h;
+}
+
+// proven route + the pattern being tried
+static void solBuildWork() {
+	g_work = g_inputs;
+	for (auto& e : solCandidate(g_sol.k)) {
+		g_work.push_back({ g_sol.frame + e.first, 1, e.second, true });
+	}
+	g_sol.tmpAn.clear();
+}
+
+static void solResolve(int kind) {
+	if (!g_sol.active || g_sol.resolved) return;
+	g_sol.resolved = true;
+	g_sol.result = kind;
+	g_sol.pendingReset = true;
+	g_sol.pendingAdvance = true;
+}
+
+// keep the chunk that was just played
+static void solCommit() {
+	g_sol.stack.push_back({ g_inputs.size(), g_anchors.size(), g_sol.frame, g_sol.k });
+	auto ev = solCandidate(g_sol.k);
+	for (auto& e : ev) {
+		g_inputs.push_back({ g_sol.frame + e.first, 1, e.second, true });
+		g_sol.holding = e.second;
+	}
+	for (auto& a : g_sol.tmpAn) g_anchors.push_back(a);
+	g_sol.tmpAn.clear();
+}
+
+// 1 = keep going, -1 = no route, -2 = try limit, -3 = lost sync
+static int solAdvance() {
+	g_sol.attempts++;
+	if (g_sol.attempts > g_sol.maxAttempts) return -2;
+	if (g_sol.result == 2) {
+		g_sol.desync++;
+		return g_sol.desync > 5 ? -3 : 1;
+	}
+	g_sol.desync = 0;
+	if (g_sol.result == 1) {
+		solCommit();
+		g_sol.frame += g_sol.chunk;
+		g_sol.k = 0;
+		return 1;
+	}
+	g_sol.k++;
+	while (g_sol.k >= kSolCands) {
+		if (g_sol.stack.empty()) return -1;
+		auto sf = g_sol.stack.back();
+		g_sol.stack.pop_back();
+		g_inputs.resize(sf.inputCount);
+		g_anchors.resize(sf.anchorCount);
+		g_sol.frame = sf.frame;
+		g_sol.k = sf.tried + 1;
+		solRecomputeHold();
+	}
+	return 1;
+}
+
+static void solRestoreSpeed() {
+	if (g_sol.savedTouched) {
+		g_speed = g_sol.savedSpeed;
+		applySpeed();
+	} else {
+		resetSpeed();
+	}
+}
+
+// code: 0 = route complete, 3 = stopped by the user, negative = gave up
+static void solFinish(int code) {
+	g_mode = 0;
+	g_sol.active = false;
+	g_sol.pendingReset = false;
+	g_sol.pendingAdvance = false;
+	solRestoreSpeed();
+	bool have = !g_inputs.empty();
+	if (have && code != -1 && !g_selected.empty()) writeMacro(g_selected);
+	if (code == 0) showSavedBox("Route found: " + std::to_string(g_inputs.size()) + " inputs, saved");
+	else if (code == 3) showSavedBox("Solver stopped. Partial route saved");
+	else if (code == -1) showSavedBox("No route found");
+	else if (code == -2) showSavedBox("Solver hit the try limit. Partial route saved");
+	else showSavedBox("Solver lost sync with the level");
+}
+
 // ---------- animated background ----------
 
 static ccColor4F starColor(float r, float g, float b, float a) {
@@ -769,8 +916,8 @@ static MacroPopup* g_manager = nullptr;
 //   0 Control  - record / play / off, speed
 //   1 Files    - create, save, load, rename, copy, delete, import / export
 //   2 Organize - favourites, tags, folders, sorting
-//   3 Edit     - undo, merge, delete a range of frames
-static char const* const kMgrTabs[] = { "Control", "Files", "Organize", "Edit" };
+//   3 Tools    - undo, merge, delete a range, window test, auto solver
+static char const* const kMgrTabs[] = { "Control", "Files", "Organize", "Tools" };
 static const int kMgrTabCount = 4;
 
 class MacroPopup : public Popup {
@@ -1049,9 +1196,13 @@ protected:
 				{ "Test windows", menu_selector(MacroPopup::onTestWindow) },
 				{ "Stop test", menu_selector(MacroPopup::onStopTest) },
 			}, rowY - step);
-			tabLabel("Merge: type the macro to append", rowY - step * 2.f + 6.f, 0.3f);
-			tabLabel("Del range: type frames like 100-500", rowY - step * 2.f - 8.f, 0.3f);
-			tabLabel("Test windows: finds each click's frame window", rowY - step * 2.f - 22.f, 0.3f);
+			addRow({
+				{ "Auto solve", menu_selector(MacroPopup::onSolve) },
+				{ "Stop solve", menu_selector(MacroPopup::onStopSolve) },
+			}, rowY - step * 2.f);
+			tabLabel("Merge: type macro to append. Del range: 100-500", rowY - step * 3.f + 6.f, 0.28f);
+			tabLabel("Test windows: finds each click's frame window", rowY - step * 3.f - 8.f, 0.28f);
+			tabLabel("Auto solve: finds clicks, replaces loaded macro", rowY - step * 3.f - 22.f, 0.28f);
 		}
 	}
 
@@ -1456,6 +1607,33 @@ protected:
 		notify(buf);
 	}
 
+	void onSolve(CCObject*) {
+		if (g_mode == 4) return notify("Solver already running");
+		g_inputs.clear();
+		g_anchors.clear();
+		g_windows.clear();
+		g_sol = Solver();
+		g_sol.active = true;
+		g_sol.chunk = S("solve-chunk");
+		g_sol.maxAttempts = S("solve-tries");
+		g_sol.savedSpeed = g_speed;
+		g_sol.savedTouched = g_speedTouched;
+		g_speed = static_cast<float>(S("solve-speed"));
+		applySpeed();
+		g_selected = nextMacroName();
+		g_cursor = 0;
+		g_anchorCursor = 0;
+		g_mode = 4;
+		notify("Solver: restart the level");
+		this->keyBackClicked();
+	}
+
+	void onStopSolve(CCObject*) {
+		if (g_mode != 4) return notify("Solver is not running");
+		solFinish(3);
+		refreshLabels();
+	}
+
 	void onTestWindow(CCObject*) {
 		if (g_inputs.empty()) return notify("Load a macro first");
 		g_wt = WinTest();
@@ -1782,6 +1960,10 @@ class $modify(GJBaseGameLayer) {
 			g_wt.pendingReset = false;
 			if (auto pl = PlayLayer::get()) pl->resetLevel();
 		}
+		if (g_sol.pendingReset) {
+			g_sol.pendingReset = false;
+			if (auto pl = PlayLayer::get()) pl->resetLevel();
+		}
 	}
 
 	// ----- frame window counter -----
@@ -1799,6 +1981,10 @@ class $modify(GJBaseGameLayer) {
 					static_cast<int>(g_wt.ci) + 1, static_cast<int>(g_wt.clicks.size()),
 					g_wt.phase == 1 ? '-' : '+', g_wt.s);
 			}
+			text = buf;
+		} else if (g_mode == 4 && g_sol.active) {
+			std::snprintf(buf, sizeof(buf), "Solving  frame %d  tries %d  option %d/%d",
+				g_sol.frame, g_sol.attempts, g_sol.k + 1, kSolCands);
 			text = buf;
 		} else if (g_mode == 2 && S("win-hud") && !g_windows.empty()) {
 			for (size_t i = g_cursor; i < g_inputs.size(); i++) {
@@ -1870,7 +2056,7 @@ class $modify(GJBaseGameLayer) {
 		auto dot = root->getChildByID("dot");
 		if (!bg || !label || !dot) return;
 
-		std::string text = g_mode == 1 ? "REC" : (g_mode == 2 ? "PLAY" : (g_mode == 3 ? "TEST" : "IDLE"));
+		std::string text = g_mode == 1 ? "REC" : (g_mode == 2 ? "PLAY" : (g_mode == 3 ? "TEST" : (g_mode == 4 ? "SOLVE" : "IDLE")));
 		if (S("hud-frame")) text += "\nFrame " + std::to_string(g_frame);
 		if (S("hud-corr") && g_mode == 2) text += "\nFixes " + std::to_string(g_corrections);
 		if (S("counter") && g_mode == 1) {
@@ -1948,7 +2134,7 @@ class $modify(GJBaseGameLayer) {
 	}
 
 	void handleButton(bool down, int button, bool p1) {
-		if ((g_mode == 2 || g_mode == 3) && !g_injecting) return;
+		if ((g_mode == 2 || g_mode == 3 || g_mode == 4) && !g_injecting) return;
 		if (g_mode == 1) {
 			MacroInput in;
 			in.frame = static_cast<int>(m_gameState.m_currentProgress);
@@ -1980,10 +2166,28 @@ class $modify(GJBaseGameLayer) {
 		g_anchors.push_back(a);
 	}
 
+	// solver: remember where the player is on every frame of the chunk
+	void recordSolAnchor(int frame) {
+		if (!m_player1 || frame == g_lastAnchorFrame) return;
+		g_lastAnchorFrame = frame;
+		MacroAnchor a{};
+		a.frame = frame;
+		a.x1 = m_player1->getPositionX();
+		a.y1 = m_player1->getPositionY();
+		a.v1 = static_cast<float>(m_player1->m_yVelocity);
+		a.dual = m_gameState.m_isDualMode && m_player2;
+		if (a.dual) {
+			a.x2 = m_player2->getPositionX();
+			a.y2 = m_player2->getPositionY();
+			a.v2 = static_cast<float>(m_player2->m_yVelocity);
+		}
+		g_sol.tmpAn.push_back(a);
+	}
+
 	// Position only: velocity is left alone so clicks keep working.
 	void alignPlayer(PlayerObject* p, float x, float y, float v) {
 		if (!p) return;
-		if (S("exact-route")) {
+		if (S("exact-route") || g_mode == 4) {
 			// exact route: put the player on the recorded spot every frame
 			float ex = p->getPositionX() - x;
 			float ey = p->getPositionY() - y;
@@ -2017,10 +2221,12 @@ class $modify(GJBaseGameLayer) {
 		if (g_mode == 1) {
 			recordAnchor(frame);
 		}
-		if (g_mode == 2 || g_mode == 3) {
+		if (g_mode == 2 || g_mode == 3 || g_mode == 4) {
 			// anchors are off while testing: the test needs the real physics
 			if (g_mode == 2) applyAnchors(frame);
-			auto& src = g_mode == 3 ? g_work : g_inputs;
+			// solver: replay the proven route exactly, then explore past its end
+			if (g_mode == 4 && frame < g_sol.frame) applyAnchors(frame);
+			auto& src = (g_mode == 3 || g_mode == 4) ? g_work : g_inputs;
 			while (g_cursor < src.size() && src[g_cursor].frame <= frame) {
 				auto i = src[g_cursor++];
 				g_injecting = true;
@@ -2029,6 +2235,10 @@ class $modify(GJBaseGameLayer) {
 			}
 			if (g_mode == 3 && g_wt.active && g_wt.phase != 0 && !g_wt.resolved && frame >= g_wt.endFrame) {
 				wtResolve(true);
+			}
+			if (g_mode == 4 && g_sol.active && !g_sol.resolved) {
+				if (frame >= g_sol.frame + g_sol.chunk) solResolve(1);
+				else if (frame >= g_sol.frame) recordSolAnchor(frame);
 			}
 		}
 		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -2065,6 +2275,19 @@ class $modify(PlayLayer) {
 			wtBuildWork();
 			g_wt.resolved = false;
 		}
+
+		if (g_mode == 4 && g_sol.active) {
+			if (g_sol.pendingAdvance) {
+				g_sol.pendingAdvance = false;
+				int r = solAdvance();
+				if (r != 1) {
+					solFinish(r);
+					return;
+				}
+			}
+			solBuildWork();
+			g_sol.resolved = false;
+		}
 	}
 
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -2073,11 +2296,22 @@ class $modify(PlayLayer) {
 			this->stopActionByTag(0x10); // cancel GD's slow delayed restart
 			wtResolve(false);
 		}
+		if (g_mode == 4 && g_sol.active && !g_sol.resolved) {
+			this->stopActionByTag(0x10);
+			// dying inside the replayed part of the route means we lost sync
+			solResolve(g_frame < g_sol.frame ? 2 : 0);
+		}
 	}
 
 	void levelComplete() {
 		if (g_mode == 3 && g_wt.active) {
 			wtResolve(true);
+			return;
+		}
+		if (g_mode == 4 && g_sol.active) {
+			if (!g_sol.resolved || g_sol.result == 1) solCommit();
+			solFinish(0);
+			PlayLayer::levelComplete();
 			return;
 		}
 		if (g_mode == 1 && !g_inputs.empty()) {
@@ -2113,6 +2347,13 @@ class $modify(PlayLayer) {
 			g_wt.active = false;
 			g_wt.pendingReset = false;
 			g_wt.pendingAdvance = false;
+		}
+		if (g_mode == 4) {
+			g_mode = 0;
+			g_sol.active = false;
+			g_sol.pendingReset = false;
+			g_sol.pendingAdvance = false;
+			solRestoreSpeed();
 		}
 		if (!S("keep-speed")) resetSpeed();
 		g_pathKey = static_cast<size_t>(-1);

@@ -21,7 +21,7 @@ jobs:
           bindings: geode-sdk/bindings
           bindings-ref: main
           combine: true
-          sdk: latest
+          sdk: v5.11.2
           target: ${{ matrix.target }}
 
   package:

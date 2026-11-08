@@ -44,6 +44,7 @@ static size_t g_anchorCursor = 0;
 static int g_lastAnchorFrame = -1;
 static int g_corrections = 0;
 static int g_frame = 0;
+static float g_tpsExtra = 0.f; // leftover time between steps for a custom tick rate
 static bool g_injecting = false;
 static int g_macroTps = 0; // tick rate the loaded macro was recorded at (0 = unknown)
 static float g_speed = 1.f;
@@ -2326,6 +2327,19 @@ class $modify(GJBaseGameLayer) {
 		(void)self.setHookPriority("GJBaseGameLayer::handleButton", Priority::First);
 	}
 
+	// Custom tick rate (TPS). At 240 the game's own timing is used untouched.
+	float getModifiedDelta(float dt) {
+		int tps = curTps();
+		if (tps == 240) return GJBaseGameLayer::getModifiedDelta(dt);
+		float modifier = std::min(1.f, m_gameState.m_timeWarp);
+		if (modifier <= 0.f) modifier = 1.f;
+		float spt = modifier / static_cast<float>(tps);
+		float total = dt + g_tpsExtra;
+		float steps = std::floor(total / spt);
+		g_tpsExtra = total - steps * spt;
+		return steps * spt;
+	}
+
 	void update(float dt) {
 		GJBaseGameLayer::update(dt);
 		// keep user speed alive through deaths/restarts/time-warp resets
@@ -2889,6 +2903,7 @@ class $modify(PlayLayer) {
 		g_pendStamp.clear();
 		g_lastRawStep = -1;
 		g_callIdx = 0;
+		g_tpsExtra = 0.f;
 		if (g_mode == 2) divReset();
 		g_diagPending = (g_mode == 3 || g_mode == 4);
 		if (m_objectLayer) {
@@ -2914,137 +2929,4 @@ class $modify(PlayLayer) {
 			if (g_wt.phase > 0 && g_wt.spOk && S("win-save") && m_isPracticeMode && !g_sps.empty()) {
 				size_t ci = static_cast<size_t>(g_wt.clicks[g_wt.ci]);
 				if (ci < g_inputs.size()) {
-					int need = g_inputs[ci].frame - S("win-max") - 3;
-					int best = -1;
-					for (size_t i = 0; i < g_sps.size(); i++) {
-						if (g_sps[i].frame <= need) best = static_cast<int>(i);
-					}
-					if (best >= 0 && spLoad(this, g_sps[best].cp)) {
-						g_wt.sp = best;
-						g_spNeedBase = true;
-						g_spExpect = g_sps[best].frame;
-						g_spVerify = 20;
-						while (g_cursor < g_work.size() && g_work[g_cursor].frame < g_spExpect) g_cursor++;
-					}
-				}
-			}
-			g_wt.resolved = false;
-		}
-
-		if (g_mode == 4 && g_sol.active) {
-			if (g_sol.pendingAdvance) {
-				g_sol.pendingAdvance = false;
-				int r = solAdvance();
-				
-				if (r != 1) {
-					solFinish(r);
-					return;
-				}
-			}
-			if (g_sol.attempts == 0 && g_sol.frame == 0 && startFrame > 0) g_sol.frame = startFrame;
-			solBuildWork();
-			g_sol.resolved = false;
-			g_solSteps = 0;
-			g_lastAnchorFrame = -1;
-			while (g_cursor < g_work.size() && g_work[g_cursor].frame < startFrame) g_cursor++;
-			while (g_anchorCursor < g_anchors.size() && g_anchors[g_anchorCursor].frame < startFrame) g_anchorCursor++;
-		}
-	}
-
-	void destroyPlayer(PlayerObject* player, GameObject* obj) {
-		// window test / solver: a death only decides the attempt, then the level is restarted
-		if ((g_mode == 3 && g_wt.active) || (g_mode == 4 && g_sol.active)) {
-			char b[200];
-			std::snprintf(b, sizeof(b), "death: x %.1f y %.1f vy %.2f frame %d obj %d",
-				player ? static_cast<float>(player->getPositionX()) : 0.f,
-				player ? static_cast<float>(player->getPositionY()) : 0.f,
-				player ? static_cast<float>(player->m_yVelocity) : 0.f,
-				g_frame, obj ? static_cast<int>(obj->m_objectID) : -1);
-			if (g_mode == 3) {
-				g_diagDeath = b;
-				if (!g_wt.resolved) {
-					if (g_wt.phase == 0) {
-						g_wt.baseEnd = g_frame;
-						wtResolve(true);
-					} else {
-						wtResolve(false);
-					}
-				}
-			} else if (!g_sol.resolved) {
-				g_diagDeath = b;
-				g_solDeathFrame = g_frame;
-				g_solDeathX = player ? static_cast<float>(player->getPositionX()) : 0.f;
-				g_solDeathObj = obj ? static_cast<int>(obj->m_objectID) : -1;
-				// dying inside the part that was already proven means the replay drifted
-				if (g_frame < g_sol.frame) solResolve(2);
-				else solResolve(0);
-			}
-			return;
-		}
-		PlayLayer::destroyPlayer(player, obj);
-	}
-
-	void levelComplete() {
-		if (g_mode == 3 && g_wt.active) {
-			if (!g_wt.resolved) {
-				if (g_wt.phase == 0) g_wt.baseEnd = 0x7fffffff;
-				wtResolve(true);
-			}
-			return;
-		}
-		if (g_mode == 4 && g_sol.active) {
-			if (!g_sol.resolved) {
-				g_sol.resolved = true;
-				solCommit();
-				solFinish(0);
-			}
-			PlayLayer::levelComplete();
-			return;
-		}
-		if (g_mode == 1 && !g_inputs.empty() && !g_selected.empty()) {
-			writeMacro(g_selected);
-		}
-		PlayLayer::levelComplete();
-	}
-
-	void onQuit() {
-		if (g_mode == 1 && !g_inputs.empty() && !g_selected.empty()) {
-			writeMacro(g_selected);
-		} else if (g_mode == 3) {
-			g_mode = 0;
-			wtRestoreSpeed();
-			spClear();
-			g_wt.active = false;
-			g_wt.pendingReset = false;
-			g_wt.pendingAdvance = false;
-		} else if (g_mode == 4) {
-			solFinish(3);
-		}
-		PlayLayer::onQuit();
-	}
-};
-
-class $modify(MacroPauseLayer, PauseLayer) {
-	void customSetup() {
-		PauseLayer::customSetup();
-
-		auto ws = CCDirector::get()->getWinSize();
-		auto menu = CCMenu::create();
-		menu->setPosition({ 0.f, 0.f });
-
-		auto btn = makeButton("Macro", this, menu_selector(MacroPauseLayer::onMacroOpen), 0.6f);
-		int corner = std::clamp(S("pause-corner"), 0, 3);
-		bool left = (corner == 1 || corner == 3);
-		bool top = corner >= 2;
-		float x = left ? 50.f : ws.width - 50.f;
-		float y = top ? ws.height - 25.f : 25.f;
-		btn->setPosition({ x, y });
-		menu->addChild(btn);
-
-		this->addChild(menu, 100);
-	}
-
-	void onMacroOpen(CCObject*) {
-		if (auto popup = MacroPopup::create()) popup->show();
-	}
-};
+					int need = g_inputs[ci].frame - S("wi

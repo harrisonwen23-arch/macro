@@ -53,6 +53,9 @@ static int g_solDeathFrame = -1;
 static float g_solDeathX = 0.f;
 static int g_solDeathObj = -1;  // object id that killed the player
 static int g_solSteps = 0;       // physics steps survived in the current attempt
+static std::string g_diag;       // player state on the first step after a restart
+static std::string g_diagDeath;  // player/object state at the last death
+static bool g_diagPending = false;
 
 // ---------- frame windows ----------
 // For every click (input index) the number of frames it can be pressed
@@ -540,6 +543,11 @@ static void showSavedBox(std::string const& text) {
 
 	auto label = CCLabelBMFont::create(text.c_str(), "bigFont.fnt");
 	label->setScale(0.45f);
+	{
+		float maxW = ws.width - 30.f;
+		float w = label->getContentSize().width;
+		if (w > 0.f && w * 0.45f > maxW) label->setScale(maxW / w);
+	}
 	auto size = label->getScaledContentSize();
 
 	auto bg = CCScale9Sprite::create("square02b_001.png", { 0.f, 0.f, 80.f, 80.f });
@@ -650,7 +658,7 @@ static void wtFinish(bool aborted) {
 	g_wt.pendingAdvance = false;
 	if (aborted) {
 		g_windows.clear();
-		showSavedBox("Test stopped: no clicks to test before the macro's death");
+		showSavedBox("Test stopped: no clicks to test before the macro's death\n" + g_diag + "\n" + g_diagDeath);
 		return;
 	}
 	if (!g_selected.empty()) writeMacro(g_selected);
@@ -794,6 +802,7 @@ static void solFinish(int code) {
 			", object " + std::to_string(g_solDeathObj) +
 			", tries " + std::to_string(g_sol.attempts);
 		if (g_solSteps <= 1) msg += ". Dies instantly here: use an earlier checkpoint";
+		msg += "\n" + g_diag + "\n" + g_diagDeath;
 		showSavedBox(msg);
 	}
 	else if (code == -2) showSavedBox("Solver hit the try limit. Partial route saved");
@@ -2275,6 +2284,19 @@ class $modify(GJBaseGameLayer) {
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		int frame = static_cast<int>(m_gameState.m_currentProgress);
 		g_frame = frame;
+		if (g_diagPending && m_player1) {
+			g_diagPending = false;
+			char b[200];
+			std::snprintf(b, sizeof(b), "start: x %.1f y %.1f vy %.2f prog %d",
+				static_cast<float>(m_player1->getPositionX()), static_cast<float>(m_player1->getPositionY()),
+				static_cast<float>(m_player1->m_yVelocity), frame);
+			g_diag = b;
+			if (!g_anchors.empty()) {
+				auto& a = g_anchors.front();
+				std::snprintf(b, sizeof(b), "\nrecorded: x %.1f y %.1f vy %.2f frame %d", a.x1, a.y1, a.v1, a.frame);
+				g_diag += b;
+			}
+		}
 		if (g_mode == 1) {
 			recordAnchor(frame);
 		}
@@ -2341,6 +2363,7 @@ class $modify(PlayLayer) {
 		g_lastAnchorFrame = -1;
 		g_corrections = 0;
 		g_pathDirty = true;
+		g_diagPending = (g_mode == 3 || g_mode == 4);
 		enforceSpeed(m_gameState.m_timeWarp);
 
 		if (g_mode == 3 && g_wt.active) {
@@ -2373,6 +2396,18 @@ class $modify(PlayLayer) {
 
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
 		PlayLayer::destroyPlayer(player, object);
+		{
+			bool fresh = (g_mode == 3) ? (g_wt.active && !g_wt.resolved) : (g_mode == 4 && g_sol.active && !g_sol.resolved);
+			if (fresh && m_player1) {
+				char b[200];
+				std::snprintf(b, sizeof(b), "died: x %.1f y %.1f, object %d at x %.1f y %.1f",
+					static_cast<float>(m_player1->getPositionX()), static_cast<float>(m_player1->getPositionY()),
+					object ? static_cast<int>(object->m_objectID) : -1,
+					object ? static_cast<float>(object->getPositionX()) : 0.f,
+					object ? static_cast<float>(object->getPositionY()) : 0.f);
+				g_diagDeath = b;
+			}
+		}
 		if (g_mode == 3 && g_wt.active && !g_wt.resolved) {
 			this->stopActionByTag(0x10); // cancel GD's slow delayed restart
 			if (g_wt.phase == 0) {

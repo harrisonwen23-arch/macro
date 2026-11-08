@@ -3,6 +3,8 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <fstream>
+#include <sstream>
+#include <iomanip>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -15,9 +17,21 @@ using namespace geode::prelude;
 
 struct MacroInput { int frame; int button; bool down; bool p1; };
 
+// A saved snapshot of the player(s) used to re-align during playback.
+struct MacroAnchor {
+	int frame;
+	float x1, y1, v1;
+	bool dual;
+	float x2, y2, v2;
+};
+
 static int g_mode = 0; // 0 = off, 1 = record, 2 = play
 static std::vector<MacroInput> g_inputs;
+static std::vector<MacroAnchor> g_anchors;
 static size_t g_cursor = 0;
+static size_t g_anchorCursor = 0;
+static int g_lastAnchorFrame = -1;
+static int g_corrections = 0;
 static bool g_injecting = false;
 static float g_speed = 1.f;
 static bool g_speedTouched = false; // true once the user changed speed
@@ -25,6 +39,8 @@ static std::string g_selected;
 
 static constexpr float kSpeedMin = 0.1f;
 static constexpr float kSpeedMax = 5.f;
+static constexpr int kAnchorEvery = 20;     // frames between anchors
+static constexpr float kAnchorTol = 0.25f;  // units of drift before correcting
 
 // ---------- theme settings ----------
 
@@ -73,10 +89,9 @@ static CCMenuItemSpriteExtra* makeButton(char const* text, CCObject* target, SEL
 
 // ---------- speed ----------
 
-// GD itself resets the scheduler time scale when a level restarts (its
-// time-warp logic writes it every reset), which is why speed used to
-// vanish after dying. We now re-apply it every frame, multiplied by the
-// level's own time warp so speed triggers still work.
+// GD itself resets the scheduler time scale when a level restarts, which is
+// why speed used to vanish after dying. We re-apply it every frame,
+// multiplied by the level's own time warp so speed triggers still work.
 static void enforceSpeed(float timeWarp) {
 	if (!g_speedTouched) return;
 	if (timeWarp <= 0.f) timeWarp = 1.f;
@@ -117,22 +132,46 @@ static std::vector<std::string> listMacros() {
 	return names;
 }
 
+// File format (one item per line):
+//   <frame> <button> <down 0/1> <p1 0/1>                      -> input
+//   A <frame> <x1> <y1> <v1> <dual 0/1> <x2> <y2> <v2>        -> anchor
 static bool writeMacro(std::string const& name) {
 	std::ofstream out(macroFile(name));
 	if (!out) return false;
+	out << std::setprecision(9);
 	for (auto& i : g_inputs) {
 		out << i.frame << ' ' << i.button << ' ' << (i.down ? 1 : 0) << ' ' << (i.p1 ? 1 : 0) << '\n';
+	}
+	for (auto& a : g_anchors) {
+		out << "A " << a.frame << ' ' << a.x1 << ' ' << a.y1 << ' ' << a.v1 << ' '
+			<< (a.dual ? 1 : 0) << ' ' << a.x2 << ' ' << a.y2 << ' ' << a.v2 << '\n';
 	}
 	return true;
 }
 
-static bool readMacro(std::string const& name, std::vector<MacroInput>& out) {
+static bool readMacro(std::string const& name, std::vector<MacroInput>& inputs, std::vector<MacroAnchor>& anchors) {
 	std::ifstream in(macroFile(name));
 	if (!in) return false;
-	out.clear();
-	int frame, button, down, p1;
-	while (in >> frame >> button >> down >> p1) {
-		out.push_back({ frame, button, down != 0, p1 != 0 });
+	inputs.clear();
+	anchors.clear();
+	std::string line;
+	while (std::getline(in, line)) {
+		if (line.empty()) continue;
+		if (line[0] == 'A') {
+			std::istringstream s(line.substr(1));
+			MacroAnchor a{};
+			int dual = 0;
+			if (s >> a.frame >> a.x1 >> a.y1 >> a.v1 >> dual >> a.x2 >> a.y2 >> a.v2) {
+				a.dual = dual != 0;
+				anchors.push_back(a);
+			}
+		} else {
+			std::istringstream s(line);
+			int frame, button, down, p1;
+			if (s >> frame >> button >> down >> p1) {
+				inputs.push_back({ frame, button, down != 0, p1 != 0 });
+			}
+		}
 	}
 	return true;
 }
@@ -149,13 +188,22 @@ static std::string cleanName(std::string const& s) {
 	return out;
 }
 
+// Names a new macro after the level being played. First one is "Level",
+// then "Level 1", "Level 2", ... Falls back to "Macro" with no level.
 static std::string nextMacroName() {
-	std::string name;
-	for (int n = 1; n < 10000; n++) {
-		name = "Macro " + std::to_string(n);
-		if (!std::filesystem::exists(macroFile(name))) break;
+	std::string base = "Macro";
+	if (auto pl = PlayLayer::get()) {
+		if (pl->m_level) {
+			auto cleaned = cleanName(std::string(pl->m_level->m_levelName));
+			if (!cleaned.empty()) base = cleaned;
+		}
 	}
-	return name;
+	if (!std::filesystem::exists(macroFile(base))) return base;
+	for (int n = 1; n < 10000; n++) {
+		auto name = base + " " + std::to_string(n);
+		if (!std::filesystem::exists(macroFile(name))) return name;
+	}
+	return base + " " + std::to_string(10000);
 }
 
 static void showSavedBox(std::string const& text) {
@@ -468,8 +516,12 @@ protected:
 
 	void onPick(CCObject* sender) {
 		g_selected = static_cast<CCNode*>(sender)->getID();
-		std::vector<MacroInput> loaded;
-		if (readMacro(g_selected, loaded)) g_inputs = loaded;
+		std::vector<MacroInput> loadedInputs;
+		std::vector<MacroAnchor> loadedAnchors;
+		if (readMacro(g_selected, loadedInputs, loadedAnchors)) {
+			g_inputs = loadedInputs;
+			g_anchors = loadedAnchors;
+		}
 		m_input->setString(g_selected);
 		rebuildList();
 		refreshLabels();
@@ -478,6 +530,7 @@ protected:
 	void onRecord(CCObject*) {
 		g_selected = nextMacroName();
 		g_inputs.clear();
+		g_anchors.clear();
 		writeMacro(g_selected);
 		g_mode = 1;
 		notify("Recording: restart the level");
@@ -490,6 +543,8 @@ protected:
 			return;
 		}
 		g_cursor = 0;
+		g_anchorCursor = 0;
+		g_corrections = 0;
 		g_mode = 2;
 		notify("Playing: restart the level");
 		this->keyBackClicked();
@@ -512,9 +567,11 @@ protected:
 
 	void onLoad(CCObject*) {
 		if (g_selected.empty()) return notify("Pick a macro first");
-		std::vector<MacroInput> loaded;
-		if (!readMacro(g_selected, loaded)) return notify("Could not load");
-		g_inputs = loaded;
+		std::vector<MacroInput> loadedInputs;
+		std::vector<MacroAnchor> loadedAnchors;
+		if (!readMacro(g_selected, loadedInputs, loadedAnchors)) return notify("Could not load");
+		g_inputs = loadedInputs;
+		g_anchors = loadedAnchors;
 		notify(g_inputs.empty() ? "Macro is empty" : "Macro loaded");
 	}
 
@@ -524,6 +581,7 @@ protected:
 		std::filesystem::remove(macroFile(g_selected), ec);
 		g_selected.clear();
 		g_inputs.clear();
+		g_anchors.clear();
 		rebuildList();
 		refreshLabels();
 		notify("Macro deleted");
@@ -531,6 +589,7 @@ protected:
 
 	void onNew(CCObject*) {
 		g_inputs.clear();
+		g_anchors.clear();
 		g_selected = nextMacroName();
 		writeMacro(g_selected);
 		m_input->setString(g_selected);
@@ -697,9 +756,54 @@ class $modify(GJBaseGameLayer) {
 		GJBaseGameLayer::handleButton(down, button, p1);
 	}
 
+	// Save a snapshot of the player(s) every kAnchorEvery frames.
+	void recordAnchor(int frame) {
+		if (!m_player1) return;
+		if (frame % kAnchorEvery != 0 || frame == g_lastAnchorFrame) return;
+		g_lastAnchorFrame = frame;
+
+		MacroAnchor a{};
+		a.frame = frame;
+		a.x1 = m_player1->getPositionX();
+		a.y1 = m_player1->getPositionY();
+		a.v1 = static_cast<float>(m_player1->m_yVelocity);
+		a.dual = m_gameState.m_isDualMode && m_player2;
+		if (a.dual) {
+			a.x2 = m_player2->getPositionX();
+			a.y2 = m_player2->getPositionY();
+			a.v2 = static_cast<float>(m_player2->m_yVelocity);
+		}
+		g_anchors.push_back(a);
+	}
+
+	// Snap a player back to the anchor if it has drifted too far.
+	void alignPlayer(PlayerObject* p, float x, float y, float v) {
+		if (!p) return;
+		float dx = p->getPositionX() - x;
+		float dy = p->getPositionY() - y;
+		if (std::fabs(dx) > kAnchorTol || std::fabs(dy) > kAnchorTol) {
+			p->setPosition({ x, y });
+			p->m_yVelocity = v;
+			g_corrections++;
+		}
+	}
+
+	void applyAnchors(int frame) {
+		while (g_anchorCursor < g_anchors.size() && g_anchors[g_anchorCursor].frame <= frame) {
+			auto& a = g_anchors[g_anchorCursor++];
+			if (a.frame != frame) continue; // missed this frame, too late to align
+			alignPlayer(m_player1, a.x1, a.y1, a.v1);
+			if (a.dual && m_gameState.m_isDualMode) alignPlayer(m_player2, a.x2, a.y2, a.v2);
+		}
+	}
+
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+		int frame = static_cast<int>(m_gameState.m_currentProgress);
+		if (g_mode == 1) {
+			recordAnchor(frame);
+		}
 		if (g_mode == 2) {
-			int frame = static_cast<int>(m_gameState.m_currentProgress);
+			applyAnchors(frame);
 			while (g_cursor < g_inputs.size() && g_inputs[g_cursor].frame <= frame) {
 				auto& i = g_inputs[g_cursor++];
 				g_injecting = true;
@@ -714,8 +818,14 @@ class $modify(GJBaseGameLayer) {
 class $modify(PlayLayer) {
 	void resetLevel() {
 		PlayLayer::resetLevel();
-		if (g_mode == 1) g_inputs.clear();
+		if (g_mode == 1) {
+			g_inputs.clear();
+			g_anchors.clear();
+		}
 		g_cursor = 0;
+		g_anchorCursor = 0;
+		g_lastAnchorFrame = -1;
+		g_corrections = 0;
 		// resetLevel clears the scheduler time scale; put our speed back
 		enforceSpeed(m_gameState.m_timeWarp);
 	}
@@ -733,6 +843,9 @@ class $modify(PlayLayer) {
 			}
 			g_mode = 0;
 		} else if (g_mode == 2) {
+			if (g_corrections > 0) {
+				showSavedBox("Playback done (" + std::to_string(g_corrections) + " corrections)");
+			}
 			g_mode = 0;
 		}
 		PlayLayer::levelComplete();

@@ -7,10 +7,14 @@
 #include <iomanip>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <ctime>
+#include <cstdint>
 #include <algorithm>
 #include <cctype>
+#include <map>
+#include <set>
 #include <filesystem>
 #include <system_error>
 
@@ -32,15 +36,20 @@ static size_t g_cursor = 0;
 static size_t g_anchorCursor = 0;
 static int g_lastAnchorFrame = -1;
 static int g_corrections = 0;
+static int g_frame = 0;
 static bool g_injecting = false;
 static float g_speed = 1.f;
 static bool g_speedTouched = false;
 static std::string g_selected;
+static std::string g_filterText;
+static std::string g_folder; // "" = all, "(none)" = untagged
+static bool g_pathDirty = true;
+static size_t g_pathKey = static_cast<size_t>(-1);
 
 static constexpr float kSpeedMin = 0.1f;
 static constexpr float kSpeedMax = 5.f;
 
-// ---------- theme / constants ----------
+// ---------- palettes ----------
 
 struct ColorPreset { char const* name; ccColor3B color; };
 static const ColorPreset kColors[] = {
@@ -54,6 +63,11 @@ static const ColorPreset kColors[] = {
 };
 static const int kColorCount = 7;
 
+static const ccColor3B kAccents[] = {
+	{ 70, 140, 255 }, { 70, 200, 110 }, { 240, 100, 170 },
+	{ 255, 150, 60 }, { 160, 110, 240 }, { 240, 200, 60 },
+};
+
 struct ShapeDef { char const* name; char const* tex; };
 static const ShapeDef kShapes[] = {
 	{ "Rounded", "square02b_001.png" },
@@ -63,52 +77,106 @@ static const ShapeDef kShapes[] = {
 };
 static const int kShapeCount = 4;
 
-// ---------- settings ----------
+// ---------- settings table ----------
 
+static char const* const kThemeNames[] = { "None", "Neon", "Sunset", "Ocean", "Minimal" };
 static char const* const kShapeNames[] = { "Rounded", "Soft", "Classic", "Dark" };
-static char const* const kColorNames[] = { "Midnight", "Purple", "Teal", "Crimson", "Forest", "Slate", "Rose" };
-static char const* const kStarNames[] = { "Off", "Few", "Normal", "Many" };
-static char const* const kStarSpeedNames[] = { "Slow", "Normal", "Fast" };
+static char const* const kColorNames[] = { "Midnight", "Purple", "Teal", "Crimson", "Forest", "Slate", "Rose", "Custom" };
+static char const* const kEndNames[] = { "Midnight", "Purple", "Teal", "Crimson", "Forest", "Slate", "Rose" };
+static char const* const kAccentNames[] = { "Blue", "Green", "Pink", "Orange", "Purple", "Gold" };
+static char const* const kAnimNames[] = { "None", "Fade", "Slide", "Bounce" };
+static char const* const kBgNames[] = { "Stars", "Snow", "Rain", "Particles", "Plain" };
+static char const* const kAmountNames[] = { "Few", "Normal", "Many" };
+static char const* const kSpeedNames[] = { "Slow", "Normal", "Fast" };
 static char const* const kCornerNames[] = { "Bottom right", "Bottom left", "Top right", "Top left" };
 static char const* const kOffOn[] = { "Off", "On" };
 static char const* const kEveryNames[] = { "10 frames", "20 frames", "40 frames" };
 static char const* const kNameFmtNames[] = { "Numbered", "Always numbered", "With date" };
+static char const* const kPfModeNames[] = { "Off", "Route", "Trail", "Both" };
+static char const* const kAheadNames[] = { "All", "100 frames", "300 frames", "600 frames" };
+static char const* const kSortNames[] = { "Name", "Newest", "Longest" };
 
 struct SettingDef {
 	char const* key;
 	char const* label;
 	int min, max, step, def;
 	char const* const* names; // nullptr = numeric
-	int div;                  // numeric display divisor
+	int div;
 	char const* unit;
 };
 
 static const SettingDef kSettings[] = {
-	// page 1: UI
+	// page 0: look
+	{ "ui-theme", "Theme", 0, 4, 1, 0, kThemeNames, 1, "" },
 	{ "ui-size", "Size", 85, 100, 5, 90, nullptr, 1, "%" },
 	{ "ui-shape", "Shape", 0, 3, 1, 0, kShapeNames, 1, "" },
-	{ "ui-color", "Colour", 0, 6, 1, 0, kColorNames, 1, "" },
 	{ "ui-opacity", "Opacity", 30, 100, 10, 100, nullptr, 1, "%" },
-	// page 2: extras
-	{ "ui-stars", "Stars", 0, 3, 1, 2, kStarNames, 1, "" },
-	{ "ui-star-speed", "Star speed", 0, 2, 1, 1, kStarSpeedNames, 1, "" },
+	// page 1: colours
+	{ "ui-color", "Colour", 0, 7, 1, 0, kColorNames, 1, "" },
+	{ "col-r", "Custom red", 0, 255, 15, 40, nullptr, 1, "" },
+	{ "col-g", "Custom green", 0, 255, 15, 40, nullptr, 1, "" },
+	{ "col-b", "Custom blue", 0, 255, 15, 90, nullptr, 1, "" },
+	// page 2: gradient and accent
+	{ "grad", "Gradient", 0, 1, 1, 0, kOffOn, 1, "" },
+	{ "grad-end", "Gradient end", 0, 6, 1, 1, kEndNames, 1, "" },
+	{ "accent", "Accent", 0, 5, 1, 0, kAccentNames, 1, "" },
+	{ "anim", "Open animation", 0, 3, 1, 0, kAnimNames, 1, "" },
+	// page 3: background and text
+	{ "bg-type", "Background", 0, 4, 1, 0, kBgNames, 1, "" },
+	{ "bg-amount", "Amount", 0, 2, 1, 1, kAmountNames, 1, "" },
+	{ "bg-speed", "Bg speed", 0, 2, 1, 1, kSpeedNames, 1, "" },
+	{ "font-size", "List text", 60, 100, 10, 100, nullptr, 1, "%" },
+	// page 4: layout
+	{ "compact", "Compact mode", 0, 1, 1, 0, kOffOn, 1, "" },
 	{ "pause-corner", "Pause button", 0, 3, 1, 0, kCornerNames, 1, "" },
 	{ "confirm-delete", "Confirm delete", 0, 1, 1, 0, kOffOn, 1, "" },
-	// page 3: playback
+	{ "keep-speed", "Keep speed", 0, 1, 1, 0, kOffOn, 1, "" },
+	// page 5: HUD
+	{ "hud", "Mini HUD", 0, 1, 1, 0, kOffOn, 1, "" },
+	{ "hud-pos", "HUD corner", 0, 3, 1, 3, kCornerNames, 1, "" },
+	{ "hud-frame", "Frame counter", 0, 1, 1, 1, kOffOn, 1, "" },
+	{ "hud-corr", "Corrections", 0, 1, 1, 1, kOffOn, 1, "" },
+	// page 6: recording
+	{ "hud-dot", "Recording dot", 0, 1, 1, 1, kOffOn, 1, "" },
+	{ "counter", "Click counter", 0, 1, 1, 0, kOffOn, 1, "" },
+	{ "autosave", "Auto-save", 0, 1, 1, 0, kOffOn, 1, "" },
+	{ "name-fmt", "Name format", 0, 2, 1, 0, kNameFmtNames, 1, "" },
+	// page 7: playback
 	{ "anchors", "Anchors", 0, 1, 1, 1, kOffOn, 1, "" },
 	{ "anchor-tol", "Anchor strength", 5, 100, 5, 20, nullptr, 10, "" },
 	{ "anchor-every", "Anchor interval", 0, 2, 1, 1, kEveryNames, 1, "" },
 	{ "loop", "Loop playback", 0, 1, 1, 0, kOffOn, 1, "" },
-	// page 4: recording
-	{ "keep-speed", "Keep speed", 0, 1, 1, 0, kOffOn, 1, "" },
-	{ "autosave", "Auto-save", 0, 1, 1, 0, kOffOn, 1, "" },
-	{ "name-fmt", "Name format", 0, 2, 1, 0, kNameFmtNames, 1, "" },
-	{ "counter", "Click counter", 0, 1, 1, 0, kOffOn, 1, "" },
+	// page 8: pathfinder
+	{ "pf-mode", "Pathfinder", 0, 3, 1, 0, kPfModeNames, 1, "" },
+	{ "pf-width", "Line width", 1, 4, 1, 2, nullptr, 1, "" },
+	{ "pf-dots", "Anchor dots", 0, 1, 1, 0, kOffOn, 1, "" },
+	{ "pf-ahead", "Route ahead", 0, 3, 1, 1, kAheadNames, 1, "" },
 };
-static const int kSettingCount = 16;
+static const int kSettingCount = 36;
 static const int kRowsPerPage = 4;
-static const int kPageCount = 4;
-static char const* const kPageTitles[] = { "UI", "Extras", "Playback", "Recording" };
+static const int kPageCount = 9;
+static char const* const kPageTitles[] = {
+	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder"
+};
+
+struct ThemeVal { char const* key; int val; };
+static const ThemeVal kThemeNeon[] = {
+	{ "ui-shape", 0 }, { "ui-color", 7 }, { "col-r", 15 }, { "col-g", 0 }, { "col-b", 45 },
+	{ "grad", 1 }, { "grad-end", 1 }, { "accent", 2 }, { "bg-type", 3 }, { "ui-opacity", 100 }, { nullptr, 0 }
+};
+static const ThemeVal kThemeSunset[] = {
+	{ "ui-shape", 0 }, { "ui-color", 3 }, { "grad", 1 }, { "grad-end", 6 }, { "accent", 5 },
+	{ "bg-type", 0 }, { "ui-opacity", 100 }, { nullptr, 0 }
+};
+static const ThemeVal kThemeOcean[] = {
+	{ "ui-shape", 1 }, { "ui-color", 2 }, { "grad", 1 }, { "grad-end", 0 }, { "accent", 0 },
+	{ "bg-type", 2 }, { "ui-opacity", 100 }, { nullptr, 0 }
+};
+static const ThemeVal kThemeMinimal[] = {
+	{ "ui-shape", 1 }, { "ui-color", 5 }, { "grad", 0 }, { "accent", 0 },
+	{ "bg-type", 4 }, { "ui-opacity", 90 }, { nullptr, 0 }
+};
+static const ThemeVal* const kThemes[] = { nullptr, kThemeNeon, kThemeSunset, kThemeOcean, kThemeMinimal };
 
 static int getInt(char const* key, int def) {
 	return Mod::get()->getSavedValue<int>(key, def);
@@ -123,17 +191,41 @@ static int getSetting(int idx) {
 	return std::clamp(getInt(d.key, d.def), d.min, d.max);
 }
 
-static bool anchorsOn() { return getInt("anchors", 1) != 0; }
-static float anchorTol() { return std::clamp(getInt("anchor-tol", 20), 5, 100) / 10.f; }
-static int anchorEvery() {
-	static const int v[] = { 10, 20, 40 };
-	return v[std::clamp(getInt("anchor-every", 1), 0, 2)];
+static int settingIndex(char const* key) {
+	for (int i = 0; i < kSettingCount; i++) {
+		if (std::strcmp(kSettings[i].key, key) == 0) return i;
+	}
+	return -1;
 }
 
-static CCScale9Sprite* makePanel(int shape, int color, CCSize size) {
+static int S(char const* key) {
+	int i = settingIndex(key);
+	return i < 0 ? 0 : getSetting(i);
+}
+
+static bool anchorsOn() { return S("anchors") != 0; }
+static float anchorTol() { return S("anchor-tol") / 10.f; }
+static int anchorEvery() {
+	static const int v[] = { 10, 20, 40 };
+	return v[std::clamp(S("anchor-every"), 0, 2)];
+}
+
+static ccColor3B accentColor() {
+	return kAccents[std::clamp(S("accent"), 0, 5)];
+}
+
+static ccColor3B baseColor() {
+	int c = S("ui-color");
+	if (c >= kColorCount) {
+		return { static_cast<GLubyte>(S("col-r")), static_cast<GLubyte>(S("col-g")), static_cast<GLubyte>(S("col-b")) };
+	}
+	return kColors[c].color;
+}
+
+static CCScale9Sprite* makePanel(int shape, ccColor3B color, CCSize size) {
 	auto panel = CCScale9Sprite::create(kShapes[shape].tex, { 0.f, 0.f, 80.f, 80.f });
 	if (!panel) panel = CCScale9Sprite::create("square02b_001.png", { 0.f, 0.f, 80.f, 80.f });
-	panel->setColor(kColors[color].color);
+	panel->setColor(color);
 	panel->setContentSize(size);
 	return panel;
 }
@@ -146,8 +238,8 @@ static CCMenuItemSpriteExtra* makeButton(char const* text, CCObject* target, SEL
 
 // ---------- speed ----------
 
-// GD resets the scheduler time scale on level restart, so we re-apply it
-// every frame, multiplied by the level's own time warp.
+// GD resets the scheduler time scale on level restart, so re-apply every
+// frame, multiplied by the level's own time warp.
 static void enforceSpeed(float timeWarp) {
 	if (!g_speedTouched) return;
 	if (timeWarp <= 0.f) timeWarp = 1.f;
@@ -189,10 +281,12 @@ static std::vector<std::string> listMacros() {
 }
 
 // Format (one item per line):
+//   T <epoch>                                                  -> saved time
 //   <frame> <button> <down 0/1> <p1 0/1>                      -> input
 //   A <frame> <x1> <y1> <v1> <dual 0/1> <x2> <y2> <v2>        -> anchor
 static void serializeMacro(std::ostream& out) {
 	out << std::setprecision(9);
+	out << "T " << static_cast<long long>(std::time(nullptr)) << '\n';
 	for (auto& i : g_inputs) {
 		out << i.frame << ' ' << i.button << ' ' << (i.down ? 1 : 0) << ' ' << (i.p1 ? 1 : 0) << '\n';
 	}
@@ -207,7 +301,7 @@ static void parseMacro(std::istream& in, std::vector<MacroInput>& inputs, std::v
 	anchors.clear();
 	std::string line;
 	while (std::getline(in, line)) {
-		if (line.empty()) continue;
+		if (line.empty() || line[0] == 'T') continue;
 		if (line[0] == 'A') {
 			std::istringstream s(line.substr(1));
 			MacroAnchor a{};
@@ -240,6 +334,35 @@ static bool readMacro(std::string const& name, std::vector<MacroInput>& inputs, 
 	return true;
 }
 
+struct MacroInfo {
+	std::string name;
+	int clicks = 0;
+	int last = 0;
+	long long stamp = 0;
+};
+
+static MacroInfo readInfo(std::string const& name) {
+	MacroInfo info;
+	info.name = name;
+	std::ifstream in(macroFile(name));
+	if (!in) return info;
+	std::string line;
+	while (std::getline(in, line)) {
+		if (line.empty()) continue;
+		if (line[0] == 'T') {
+			info.stamp = std::atoll(line.c_str() + 1);
+		} else if (line[0] != 'A') {
+			std::istringstream s(line);
+			int frame, button, down, p1;
+			if (s >> frame >> button >> down >> p1) {
+				if (down) info.clicks++;
+				info.last = std::max(info.last, frame);
+			}
+		}
+	}
+	return info;
+}
+
 static std::string cleanName(std::string const& s) {
 	std::string out;
 	for (char c : s) {
@@ -252,7 +375,11 @@ static std::string cleanName(std::string const& s) {
 	return out;
 }
 
-// base, base 1, base 2, ... (startAtOne skips the plain base name)
+static std::string lowerStr(std::string s) {
+	for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	return s;
+}
+
 static std::string uniqueName(std::string const& base, bool startAtOne) {
 	if (!startAtOne && !std::filesystem::exists(macroFile(base))) return base;
 	for (int n = 1; n < 10000; n++) {
@@ -262,7 +389,6 @@ static std::string uniqueName(std::string const& base, bool startAtOne) {
 	return base + " " + std::to_string(10000);
 }
 
-// Names a new macro after the level being played.
 static std::string nextMacroName() {
 	std::string base = "Macro";
 	if (auto pl = PlayLayer::get()) {
@@ -271,7 +397,7 @@ static std::string nextMacroName() {
 			if (!cleaned.empty()) base = cleaned;
 		}
 	}
-	int fmt = std::clamp(getInt("name-fmt", 0), 0, 2);
+	int fmt = std::clamp(S("name-fmt"), 0, 2);
 	if (fmt == 1) return uniqueName(base, true);
 	if (fmt == 2) {
 		std::time_t t = std::time(nullptr);
@@ -280,6 +406,40 @@ static std::string nextMacroName() {
 		return uniqueName(base + " " + buf, false);
 	}
 	return uniqueName(base, false);
+}
+
+// ---------- favourites and tags ----------
+
+static std::set<std::string> loadFavs() {
+	std::set<std::string> s;
+	std::istringstream in(Mod::get()->getSavedValue<std::string>("favs", ""));
+	std::string l;
+	while (std::getline(in, l)) if (!l.empty()) s.insert(l);
+	return s;
+}
+
+static void saveFavs(std::set<std::string> const& s) {
+	std::string out;
+	for (auto& n : s) out += n + "\n";
+	Mod::get()->setSavedValue<std::string>("favs", out);
+}
+
+static std::map<std::string, std::string> loadTags() {
+	std::map<std::string, std::string> m;
+	std::istringstream in(Mod::get()->getSavedValue<std::string>("tags", ""));
+	std::string l;
+	while (std::getline(in, l)) {
+		auto p = l.find('\t');
+		if (p == std::string::npos || p == 0) continue;
+		m[l.substr(0, p)] = l.substr(p + 1);
+	}
+	return m;
+}
+
+static void saveTags(std::map<std::string, std::string> const& m) {
+	std::string out;
+	for (auto& [k, v] : m) if (!v.empty()) out += k + "\t" + v + "\n";
+	Mod::get()->setSavedValue<std::string>("tags", out);
 }
 
 static void showSavedBox(std::string const& text) {
@@ -312,22 +472,26 @@ static void showSavedBox(std::string const& text) {
 	scene->addChild(node, 10000);
 }
 
-// ---------- shooting star background ----------
+// ---------- animated background ----------
 
 static ccColor4F starColor(float r, float g, float b, float a) {
 	return ccc4f(r * a, g * a, b * a, a);
 }
 
-class StarField : public CCNode {
+class BgField : public CCNode {
 protected:
 	struct Shoot { float x0, y0, dx, dy, len, t, speed; };
 	struct Twinkle { float x, y, phase, speed, size; };
+	struct P { float x, y, vx, vy, size, phase; };
 
 	CCDrawNode* m_draw = nullptr;
 	CCSize m_area;
 	float m_timeMul = 1.f;
+	int m_type = 0;
+	ccColor3B m_accent = { 255, 255, 255 };
 	std::vector<Shoot> m_shoots;
 	std::vector<Twinkle> m_twinkles;
+	std::vector<P> m_ps;
 
 	static float rnd() {
 		return static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
@@ -347,49 +511,59 @@ protected:
 		s.speed = 0.4f + rnd() * 0.4f;
 	}
 
-	bool init(CCSize area, int amount, int speedIdx) {
+	bool init(CCSize area, int type, int amount, int speedIdx) {
 		if (!CCNode::init()) return false;
 		m_area = area;
-		static const float mul[] = { 0.5f, 1.f, 2.f };
-		m_timeMul = mul[std::clamp(speedIdx, 0, 2)];
+		m_type = type;
+		m_accent = accentColor();
+		static const float tmul[] = { 0.5f, 1.f, 2.f };
+		static const float amul[] = { 0.4f, 1.f, 2.f };
+		m_timeMul = tmul[std::clamp(speedIdx, 0, 2)];
+		float am = amul[std::clamp(amount, 0, 2)];
 		m_draw = CCDrawNode::create();
 		this->addChild(m_draw);
 
-		int twinkles = amount == 1 ? 15 : (amount == 3 ? 80 : 40);
-		int shoots = amount == 1 ? 2 : (amount == 3 ? 8 : 4);
-
-		for (int i = 0; i < twinkles; i++) {
-			m_twinkles.push_back({
-				rnd() * area.width, rnd() * area.height,
-				rnd() * 6.28f, 1.f + rnd() * 2.f, 0.5f + rnd() * 1.1f
-			});
-		}
-		for (int i = 0; i < shoots; i++) {
-			Shoot s{};
-			respawn(s);
-			s.t -= static_cast<float>(i) * 0.6f;
-			m_shoots.push_back(s);
+		if (type == 0) {
+			int twinkles = static_cast<int>(40 * am);
+			int shoots = std::max(1, static_cast<int>(4 * am));
+			for (int i = 0; i < twinkles; i++) {
+				m_twinkles.push_back({
+					rnd() * area.width, rnd() * area.height,
+					rnd() * 6.28f, 1.f + rnd() * 2.f, 0.5f + rnd() * 1.1f
+				});
+			}
+			for (int i = 0; i < shoots; i++) {
+				Shoot s{};
+				respawn(s);
+				s.t -= static_cast<float>(i) * 0.6f;
+				m_shoots.push_back(s);
+			}
+		} else {
+			int n = static_cast<int>((type == 1 ? 60 : (type == 2 ? 50 : 40)) * am);
+			for (int i = 0; i < n; i++) {
+				P p{};
+				p.x = rnd() * area.width;
+				p.y = rnd() * area.height;
+				p.phase = rnd() * 6.28f;
+				if (type == 1) { p.vy = -(15.f + rnd() * 25.f); p.vx = 0.f; p.size = 0.8f + rnd() * 1.6f; }
+				else if (type == 2) { p.vy = -(200.f + rnd() * 120.f); p.vx = -30.f; p.size = 0.7f; }
+				else { p.vy = 10.f + rnd() * 15.f; p.vx = (rnd() - 0.5f) * 10.f; p.size = 1.f + rnd() * 2.f; }
+				m_ps.push_back(p);
+			}
 		}
 		this->scheduleUpdate();
 		return true;
 	}
 
-	void update(float dt) override {
-		dt *= m_timeMul;
-		m_draw->clear();
-
+	void updateStars(float dt) {
 		for (auto& tw : m_twinkles) {
 			tw.phase += dt * tw.speed;
 			float a = 0.25f + 0.55f * (0.5f + 0.5f * std::sin(tw.phase));
 			m_draw->drawDot({ tw.x, tw.y }, tw.size, starColor(0.8f, 0.9f, 1.f, a));
 		}
-
 		for (auto& s : m_shoots) {
 			s.t += dt * s.speed;
-			if (s.t >= 1.f) {
-				respawn(s);
-				continue;
-			}
+			if (s.t >= 1.f) { respawn(s); continue; }
 			if (s.t < 0.f) continue;
 
 			float fade = std::sin(3.14159f * s.t);
@@ -411,10 +585,43 @@ protected:
 		}
 	}
 
+	void updateParticles(float dt) {
+		for (auto& p : m_ps) {
+			p.phase += dt * 2.f;
+			p.y += p.vy * dt;
+			p.x += p.vx * dt;
+			if (m_type == 1) p.x += std::sin(p.phase) * 12.f * dt;
+
+			bool out = p.y < -6.f || p.y > m_area.height + 6.f || p.x < -6.f || p.x > m_area.width + 6.f;
+			if (out) {
+				p.x = rnd() * m_area.width;
+				p.y = p.vy < 0.f ? m_area.height + 4.f : -4.f;
+			}
+
+			if (m_type == 1) {
+				m_draw->drawDot({ p.x, p.y }, p.size, starColor(1.f, 1.f, 1.f, 0.7f));
+			} else if (m_type == 2) {
+				m_draw->drawSegment({ p.x, p.y }, { p.x - p.vx * 0.03f, p.y - p.vy * 0.03f }, 0.6f,
+					starColor(0.65f, 0.8f, 1.f, 0.5f));
+			} else {
+				float a = 0.2f + 0.5f * (0.5f + 0.5f * std::sin(p.phase));
+				m_draw->drawDot({ p.x, p.y }, p.size,
+					starColor(m_accent.r / 255.f, m_accent.g / 255.f, m_accent.b / 255.f, a));
+			}
+		}
+	}
+
+	void update(float dt) override {
+		dt *= m_timeMul;
+		m_draw->clear();
+		if (m_type == 0) updateStars(dt);
+		else updateParticles(dt);
+	}
+
 public:
-	static StarField* create(CCSize area, int amount, int speedIdx) {
-		auto ret = new StarField();
-		if (ret->init(area, amount, speedIdx)) {
+	static BgField* create(CCSize area, int type, int amount, int speedIdx) {
+		auto ret = new BgField();
+		if (ret->init(area, type, amount, speedIdx)) {
 			ret->autorelease();
 			return ret;
 		}
@@ -433,46 +640,77 @@ protected:
 	CCLabelBMFont* m_modeLabel = nullptr;
 	CCLabelBMFont* m_selLabel = nullptr;
 	CCLabelBMFont* m_speedLabel = nullptr;
+	CCLabelBMFont* m_viewLabel = nullptr;
 	Slider* m_speedSlider = nullptr;
 	TextInput* m_input = nullptr;
+	TextInput* m_search = nullptr;
 	ScrollLayer* m_list = nullptr;
 	float m_listW = 0.f;
+	bool m_compact = false;
 
 	bool init() {
 		auto ws = CCDirector::get()->getWinSize();
-		int sizePct = getSetting(0);
-		int shape = getSetting(1);
-		int color = getSetting(2);
-		int opacity = getSetting(3);
-		int stars = getSetting(4);
-		int starSpeed = getSetting(5);
+		m_compact = S("compact") != 0;
+		int sizePct = S("ui-size");
+		int shape = S("ui-shape");
+		int opacity = S("ui-opacity");
+		int bgType = S("bg-type");
+		int anim = S("anim");
 
 		float pw = ws.width * sizePct / 100.f;
 		float ph = ws.height * sizePct / 100.f;
+		if (m_compact) {
+			pw = std::min(pw, ws.width * 0.62f);
+			ph = ws.height * 0.78f;
+		}
+		if (anim >= 2) m_noElasticity = true;
 		if (!Popup::init(pw, ph)) return false;
 
 		m_bgSprite->setVisible(false);
 		this->setTitle("Macro Manager");
 
-		auto panel = makePanel(shape, color, { pw, ph });
+		auto base = baseColor();
+		auto panel = makePanel(shape, base, { pw, ph });
 		panel->setOpacity(static_cast<GLubyte>(255 * opacity / 100));
 		m_mainLayer->addChildAtPosition(panel, Anchor::Center);
 		panel->setZOrder(-10);
 
-		if (stars > 0) {
-			auto field = StarField::create({ pw, ph }, stars, starSpeed);
+		if (S("grad")) {
+			auto end = kColors[std::clamp(S("grad-end"), 0, kColorCount - 1)].color;
+			auto g = CCLayerGradient::create(ccc4(base.r, base.g, base.b, 255), ccc4(end.r, end.g, end.b, 255));
+			g->setContentSize({ pw - 8.f, ph - 8.f });
+			g->ignoreAnchorPointForPosition(false);
+			g->setAnchorPoint({ 0.5f, 0.5f });
+			g->setOpacity(static_cast<GLubyte>(255 * opacity / 100));
+			m_mainLayer->addChildAtPosition(g, Anchor::Center);
+			g->setZOrder(-9);
+		}
+
+		if (bgType < 4) {
+			auto field = BgField::create({ pw, ph }, bgType, S("bg-amount"), S("bg-speed"));
 			if (field) {
 				m_mainLayer->addChildAtPosition(field, Anchor::Center, { -pw / 2.f, -ph / 2.f });
-				field->setZOrder(-9);
+				field->setZOrder(-8);
 			}
 		}
 
 		float leftX = -pw * 0.23f;
 		float rightX = pw * 0.25f;
 		m_listW = pw * 0.44f;
-		float listH = ph - 80.f;
-		float listY = -12.f;
 		float top = ph / 2.f;
+		float listH = ph - 104.f;
+		float listY = -10.f;
+
+		// search + view label
+		m_search = TextInput::create(m_listW, "Search");
+		m_search->setScale(0.8f);
+		m_search->setString(g_filterText);
+		m_search->setCallback([this](std::string const& s) {
+			g_filterText = s;
+			this->rebuildList();
+		});
+		m_mainLayer->addChildAtPosition(m_search, Anchor::Center, { leftX, top - 36.f });
+		m_viewLabel = addLabel("", leftX, top - 56.f, 0.33f);
 
 		auto listBg = CCScale9Sprite::create("square02b_001.png", { 0.f, 0.f, 80.f, 80.f });
 		listBg->setColor({ 0, 0, 0 });
@@ -487,45 +725,71 @@ protected:
 		m_mainLayer->addChildAtPosition(m_list, Anchor::Center, { leftX, listY });
 
 		float y = top - 42.f;
-		m_modeLabel = addLabel("", rightX, y, 0.65f);
+		m_modeLabel = addLabel("", rightX, y, 0.6f);
 
-		y -= 28.f;
-		addBtn("Record", menu_selector(MacroPopup::onRecord), rightX - 55.f, y, 0.7f);
-		addBtn("Play", menu_selector(MacroPopup::onPlay), rightX + 21.f, y, 0.7f);
-		addBtn("Off", menu_selector(MacroPopup::onOff), rightX + 81.f, y, 0.7f);
+		if (m_compact) {
+			y -= 34.f;
+			addBtn("Record", menu_selector(MacroPopup::onRecord), rightX, y, 0.6f);
+			y -= 30.f;
+			addBtn("Play", menu_selector(MacroPopup::onPlay), rightX, y, 0.6f);
+			y -= 30.f;
+			addBtn("Off", menu_selector(MacroPopup::onOff), rightX, y, 0.6f);
+			y -= 28.f;
+			m_selLabel = addLabel("", rightX, y, 0.4f);
+			y -= 30.f;
+			m_speedLabel = addLabel("", rightX, y, 0.5f);
+			y -= 20.f;
+			addSpeedSlider(rightX, y, 0.5f);
+		} else {
+			float s = 0.5f;
+			y -= 22.f;
+			addBtn("Record", menu_selector(MacroPopup::onRecord), rightX - 52.f, y, 0.55f);
+			addBtn("Play", menu_selector(MacroPopup::onPlay), rightX + 4.f, y, 0.55f);
+			addBtn("Off", menu_selector(MacroPopup::onOff), rightX + 52.f, y, 0.55f);
 
-		y -= 24.f;
-		m_selLabel = addLabel("", rightX, y, 0.5f);
+			y -= 20.f;
+			m_selLabel = addLabel("", rightX, y, 0.4f);
 
-		y -= 30.f;
-		m_input = TextInput::create(130.f, "New name");
-		m_input->setMaxCharCount(24);
-		m_mainLayer->addChildAtPosition(m_input, Anchor::Center, { rightX - 45.f, y });
-		addBtn("Rename", menu_selector(MacroPopup::onRename), rightX + 72.f, y, 0.7f);
+			y -= 22.f;
+			m_input = TextInput::create(150.f, "Name / tag / range");
+			m_input->setScale(0.7f);
+			m_input->setMaxCharCount(24);
+			m_mainLayer->addChildAtPosition(m_input, Anchor::Center, { rightX - 35.f, y });
+			addBtn("Rename", menu_selector(MacroPopup::onRename), rightX + 72.f, y, s);
 
-		y -= 28.f;
-		addBtn("Save", menu_selector(MacroPopup::onSave), rightX - 88.f, y, 0.62f);
-		addBtn("Load", menu_selector(MacroPopup::onLoad), rightX - 33.f, y, 0.62f);
-		addBtn("Delete", menu_selector(MacroPopup::onDelete), rightX + 30.f, y, 0.62f);
-		addBtn("New", menu_selector(MacroPopup::onNew), rightX + 91.f, y, 0.62f);
+			y -= 22.f;
+			addBtn("Save", menu_selector(MacroPopup::onSave), rightX - 84.f, y, s);
+			addBtn("Load", menu_selector(MacroPopup::onLoad), rightX - 28.f, y, s);
+			addBtn("Delete", menu_selector(MacroPopup::onDelete), rightX + 28.f, y, s);
+			addBtn("New", menu_selector(MacroPopup::onNew), rightX + 84.f, y, s);
 
-		y -= 26.f;
-		addBtn("Copy", menu_selector(MacroPopup::onCopy), rightX - 62.f, y, 0.62f);
-		addBtn("Export", menu_selector(MacroPopup::onExport), rightX, y, 0.62f);
-		addBtn("Import", menu_selector(MacroPopup::onImport), rightX + 62.f, y, 0.62f);
+			y -= 22.f;
+			addBtn("Copy", menu_selector(MacroPopup::onCopy), rightX - 56.f, y, s);
+			addBtn("Export", menu_selector(MacroPopup::onExport), rightX, y, s);
+			addBtn("Import", menu_selector(MacroPopup::onImport), rightX + 56.f, y, s);
 
-		y -= 26.f;
-		m_speedLabel = addLabel("", rightX, y, 0.6f);
+			y -= 22.f;
+			addBtn("Fav", menu_selector(MacroPopup::onFav), rightX - 84.f, y, s);
+			addBtn("Tag", menu_selector(MacroPopup::onTag), rightX - 28.f, y, s);
+			addBtn("Folder", menu_selector(MacroPopup::onFolder), rightX + 28.f, y, s);
+			addBtn("Sort", menu_selector(MacroPopup::onSort), rightX + 84.f, y, s);
 
-		y -= 20.f;
-		m_speedSlider = Slider::create(this, menu_selector(MacroPopup::onSpeedSlider), 0.6f);
-		m_speedSlider->setValue(speedToSlider(g_speed));
-		m_mainLayer->addChildAtPosition(m_speedSlider, Anchor::Center, { rightX, y });
+			y -= 22.f;
+			addBtn("Undo", menu_selector(MacroPopup::onUndo), rightX - 56.f, y, s);
+			addBtn("Merge", menu_selector(MacroPopup::onMerge), rightX, y, s);
+			addBtn("Del range", menu_selector(MacroPopup::onDelRange), rightX + 58.f, y, s);
 
-		y -= 24.f;
-		addBtn("0.5x", menu_selector(MacroPopup::onPreset), rightX - 52.f, y, 0.55f)->setTag(50);
-		addBtn("1x", menu_selector(MacroPopup::onPreset), rightX, y, 0.55f)->setTag(100);
-		addBtn("2x", menu_selector(MacroPopup::onPreset), rightX + 52.f, y, 0.55f)->setTag(200);
+			y -= 22.f;
+			m_speedLabel = addLabel("", rightX, y, 0.5f);
+
+			y -= 17.f;
+			addSpeedSlider(rightX, y, 0.55f);
+
+			y -= 20.f;
+			addBtn("0.5x", menu_selector(MacroPopup::onPreset), rightX - 44.f, y, 0.45f)->setTag(50);
+			addBtn("1x", menu_selector(MacroPopup::onPreset), rightX, y, 0.45f)->setTag(100);
+			addBtn("2x", menu_selector(MacroPopup::onPreset), rightX + 44.f, y, 0.45f)->setTag(200);
+		}
 
 		// settings (gear) button
 		auto gear = CCSprite::createWithSpriteFrameName("GJ_optionsBtn02_001.png");
@@ -535,10 +799,31 @@ protected:
 			m_buttonMenu->addChildAtPosition(gearBtn, Anchor::TopRight, { -26.f, -26.f });
 		}
 
+		playIntro(panel, opacity);
 		rebuildList();
 		refreshLabels();
 		g_manager = this;
 		return true;
+	}
+
+	void playIntro(CCScale9Sprite* panel, int opacity) {
+		int anim = S("anim");
+		if (anim == 1) {
+			panel->setOpacity(0);
+			panel->runAction(CCFadeTo::create(0.3f, static_cast<GLubyte>(255 * opacity / 100)));
+		} else if (anim == 2) {
+			m_mainLayer->setPositionY(m_mainLayer->getPositionY() - 80.f);
+			m_mainLayer->runAction(CCEaseExponentialOut::create(CCMoveBy::create(0.3f, ccp(0.f, 80.f))));
+		} else if (anim == 3) {
+			m_mainLayer->setScale(0.6f);
+			m_mainLayer->runAction(CCEaseBackOut::create(CCScaleTo::create(0.35f, 1.f)));
+		}
+	}
+
+	void addSpeedSlider(float x, float y, float scale) {
+		m_speedSlider = Slider::create(this, menu_selector(MacroPopup::onSpeedSlider), scale);
+		m_speedSlider->setValue(speedToSlider(g_speed));
+		m_mainLayer->addChildAtPosition(m_speedSlider, Anchor::Center, { x, y });
 	}
 
 	static float speedToSlider(float s) {
@@ -568,32 +853,89 @@ protected:
 		auto content = m_list->m_contentLayer;
 		content->removeAllChildrenWithCleanup(true);
 
-		auto names = listMacros();
-		if (names.empty()) {
-			auto label = CCLabelBMFont::create("No macros yet. Tap Record.", "bigFont.fnt");
+		auto favs = loadFavs();
+		auto tags = loadTags();
+		int sort = std::clamp(getInt("sort-mode", 0), 0, 2);
+		std::string needle = lowerStr(g_filterText);
+
+		std::vector<MacroInfo> infos;
+		for (auto& name : listMacros()) {
+			if (!needle.empty() && lowerStr(name).find(needle) == std::string::npos) continue;
+			auto tagIt = tags.find(name);
+			std::string tag = tagIt == tags.end() ? "" : tagIt->second;
+			if (!g_folder.empty()) {
+				if (g_folder == "(none)") { if (!tag.empty()) continue; }
+				else if (tag != g_folder) continue;
+			}
+			infos.push_back(readInfo(name));
+		}
+
+		std::stable_sort(infos.begin(), infos.end(), [&](MacroInfo const& a, MacroInfo const& b) {
+			bool fa = favs.count(a.name) > 0;
+			bool fb = favs.count(b.name) > 0;
+			if (fa != fb) return fa;
+			if (sort == 1) return a.stamp > b.stamp;
+			if (sort == 2) return a.last > b.last;
+			return a.name < b.name;
+		});
+
+		if (infos.empty()) {
+			auto label = CCLabelBMFont::create("No macros found.", "bigFont.fnt");
 			label->setScale(0.5f);
 			content->addChild(label);
 		}
-		for (auto& name : names) {
+
+		float fs = S("font-size") / 100.f;
+		for (auto& info : infos) {
+			auto& name = info.name;
 			auto row = CCMenu::create();
 			row->ignoreAnchorPointForPosition(false);
 			row->setAnchorPoint({ 0.5f, 0.5f });
-			row->setContentSize({ m_listW, 34.f });
+			row->setContentSize({ m_listW, 42.f });
+
+			std::string text;
+			if (favs.count(name)) text += "* ";
+			auto tagIt = tags.find(name);
+			if (tagIt != tags.end() && !tagIt->second.empty()) text += "[" + tagIt->second + "] ";
+			text += name;
 
 			bool sel = (name == g_selected);
-			float scale = 0.7f;
+			float scale = 0.7f * fs;
 			auto spr = ButtonSprite::create(
-				name.c_str(), static_cast<int>((m_listW - 24.f) / scale), true,
+				text.c_str(), static_cast<int>((m_listW - 24.f) / scale), true,
 				"bigFont.fnt", sel ? "GJ_button_02.png" : "GJ_button_01.png", 30.f, 0.8f
 			);
 			spr->setScale(scale);
+			if (sel) spr->setColor(accentColor());
 			auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(MacroPopup::onPick));
 			btn->setID(name);
-			row->addChildAtPosition(btn, Anchor::Center);
+			row->addChildAtPosition(btn, Anchor::Center, { 0.f, 6.f });
+
+			char date[16] = "?";
+			if (info.stamp > 0) {
+				std::time_t t = static_cast<std::time_t>(info.stamp);
+				if (auto tm = std::localtime(&t)) std::strftime(date, sizeof(date), "%Y-%m-%d", tm);
+			}
+			char buf[96];
+			std::snprintf(buf, sizeof(buf), "%d clicks | %d f | %s", info.clicks, info.last, date);
+			auto infoLabel = CCLabelBMFont::create(buf, "chatFont.fnt");
+			infoLabel->setScale(0.45f);
+			infoLabel->setOpacity(190);
+			row->addChildAtPosition(infoLabel, Anchor::Bottom, { 0.f, 7.f });
+
 			content->addChild(row);
 		}
 		content->updateLayout();
 		m_list->scrollToTop();
+		refreshView();
+	}
+
+	void refreshView() {
+		if (!m_viewLabel) return;
+		int sort = std::clamp(getInt("sort-mode", 0), 0, 2);
+		std::string f = g_folder.empty() ? "All" : g_folder;
+		std::string s = std::string("Sort: ") + kSortNames[sort] + "  Folder: " + f;
+		m_viewLabel->setString(s.c_str());
 	}
 
 	void refreshLabels() {
@@ -614,6 +956,10 @@ protected:
 		Notification::create(text)->show();
 	}
 
+	std::string inputText() {
+		return m_input ? std::string(m_input->getString()) : std::string();
+	}
+
 	void onPick(CCObject* sender) {
 		g_selected = static_cast<CCNode*>(sender)->getID();
 		std::vector<MacroInput> loadedInputs;
@@ -622,7 +968,7 @@ protected:
 			g_inputs = loadedInputs;
 			g_anchors = loadedAnchors;
 		}
-		m_input->setString(g_selected);
+		if (m_input) m_input->setString(g_selected);
 		rebuildList();
 		refreshLabels();
 	}
@@ -645,6 +991,7 @@ protected:
 		g_cursor = 0;
 		g_anchorCursor = 0;
 		g_corrections = 0;
+		g_pathDirty = true;
 		g_mode = 2;
 		notify("Playing: restart the level");
 		this->keyBackClicked();
@@ -663,6 +1010,7 @@ protected:
 		if (g_selected.empty()) return notify("Tap Record or pick a macro first");
 		if (g_inputs.empty()) return notify("Nothing recorded yet");
 		notify(writeMacro(g_selected) ? "Macro saved" : "Save failed");
+		rebuildList();
 	}
 
 	void onLoad(CCObject*) {
@@ -678,6 +1026,12 @@ protected:
 	void doDelete() {
 		std::error_code ec;
 		std::filesystem::remove(macroFile(g_selected), ec);
+		auto favs = loadFavs();
+		favs.erase(g_selected);
+		saveFavs(favs);
+		auto tags = loadTags();
+		tags.erase(g_selected);
+		saveTags(tags);
 		g_selected.clear();
 		g_inputs.clear();
 		g_anchors.clear();
@@ -688,7 +1042,7 @@ protected:
 
 	void onDelete(CCObject*) {
 		if (g_selected.empty()) return notify("Pick a macro first");
-		if (getInt("confirm-delete", 0)) {
+		if (S("confirm-delete")) {
 			createQuickPopup(
 				"Delete macro",
 				"Delete <cy>" + g_selected + "</c>? This can't be undone.",
@@ -707,7 +1061,7 @@ protected:
 		g_anchors.clear();
 		g_selected = nextMacroName();
 		writeMacro(g_selected);
-		m_input->setString(g_selected);
+		if (m_input) m_input->setString(g_selected);
 		rebuildList();
 		refreshLabels();
 	}
@@ -717,8 +1071,13 @@ protected:
 		if (g_inputs.empty()) return notify("Nothing to copy");
 		auto name = uniqueName(g_selected + " copy", false);
 		if (!writeMacro(name)) return notify("Copy failed");
+		auto tags = loadTags();
+		if (tags.count(g_selected)) {
+			tags[name] = tags[g_selected];
+			saveTags(tags);
+		}
 		g_selected = name;
-		m_input->setString(g_selected);
+		if (m_input) m_input->setString(g_selected);
 		rebuildList();
 		refreshLabels();
 		notify("Macro duplicated");
@@ -744,7 +1103,7 @@ protected:
 		g_anchors = anchors;
 		g_selected = uniqueName("Imported", false);
 		if (!writeMacro(g_selected)) return notify("Import failed");
-		m_input->setString(g_selected);
+		if (m_input) m_input->setString(g_selected);
 		rebuildList();
 		refreshLabels();
 		notify("Macro imported");
@@ -752,17 +1111,110 @@ protected:
 
 	void onRename(CCObject*) {
 		if (g_selected.empty()) return notify("Pick a macro first");
-		auto newName = cleanName(m_input->getString());
+		auto newName = cleanName(inputText());
 		if (newName.empty()) return notify("Type a valid name first");
 		if (newName == g_selected) return;
 		if (std::filesystem::exists(macroFile(newName))) return notify("That name is taken");
 		std::error_code ec;
 		std::filesystem::rename(macroFile(g_selected), macroFile(newName), ec);
 		if (ec) return notify("Rename failed");
+
+		auto favs = loadFavs();
+		if (favs.erase(g_selected)) { favs.insert(newName); saveFavs(favs); }
+		auto tags = loadTags();
+		auto it = tags.find(g_selected);
+		if (it != tags.end()) { tags[newName] = it->second; tags.erase(g_selected); saveTags(tags); }
+
 		g_selected = newName;
 		rebuildList();
 		refreshLabels();
 		notify("Renamed");
+	}
+
+	void onFav(CCObject*) {
+		if (g_selected.empty()) return notify("Pick a macro first");
+		auto favs = loadFavs();
+		if (favs.count(g_selected)) { favs.erase(g_selected); notify("Removed from favourites"); }
+		else { favs.insert(g_selected); notify("Added to favourites"); }
+		saveFavs(favs);
+		rebuildList();
+	}
+
+	void onTag(CCObject*) {
+		if (g_selected.empty()) return notify("Pick a macro first");
+		auto tag = cleanName(inputText());
+		auto tags = loadTags();
+		if (tag.empty() || tag == g_selected) { tags.erase(g_selected); notify("Tag cleared"); }
+		else { tags[g_selected] = tag; notify("Tag set"); }
+		saveTags(tags);
+		rebuildList();
+	}
+
+	void onFolder(CCObject*) {
+		auto tags = loadTags();
+		std::set<std::string> uniq;
+		for (auto& [k, v] : tags) if (!v.empty()) uniq.insert(v);
+		std::vector<std::string> folders = { "" };
+		for (auto& t : uniq) folders.push_back(t);
+		folders.push_back("(none)");
+		size_t cur = 0;
+		for (size_t i = 0; i < folders.size(); i++) if (folders[i] == g_folder) cur = i;
+		g_folder = folders[(cur + 1) % folders.size()];
+		rebuildList();
+	}
+
+	void onSort(CCObject*) {
+		setInt("sort-mode", (std::clamp(getInt("sort-mode", 0), 0, 2) + 1) % 3);
+		rebuildList();
+	}
+
+	void onUndo(CCObject*) {
+		if (g_inputs.empty()) return notify("Nothing to undo");
+		g_inputs.pop_back();
+		notify("Last input removed. Tap Save to keep it");
+	}
+
+	void onMerge(CCObject*) {
+		if (g_selected.empty() || g_inputs.empty()) return notify("Select a macro first");
+		auto second = cleanName(inputText());
+		if (second.empty()) return notify("Type the macro to append");
+		if (second == g_selected) return notify("Pick a different macro");
+		std::vector<MacroInput> in2;
+		std::vector<MacroAnchor> an2;
+		if (!readMacro(second, in2, an2)) return notify("Macro not found");
+
+		int offset = 0;
+		for (auto& i : g_inputs) offset = std::max(offset, i.frame);
+		for (auto& a : g_anchors) offset = std::max(offset, a.frame);
+		offset += 1;
+		for (auto i : in2) { i.frame += offset; g_inputs.push_back(i); }
+		for (auto a : an2) { a.frame += offset; g_anchors.push_back(a); }
+
+		auto name = uniqueName(g_selected + " + " + second, false);
+		if (!writeMacro(name)) return notify("Merge failed");
+		g_selected = name;
+		rebuildList();
+		refreshLabels();
+		notify("Macros merged");
+	}
+
+	void onDelRange(CCObject*) {
+		if (g_inputs.empty()) return notify("Nothing loaded");
+		int a = 0, b = 0;
+		auto txt = inputText();
+		if (std::sscanf(txt.c_str(), "%d-%d", &a, &b) != 2 && std::sscanf(txt.c_str(), "%d %d", &a, &b) != 2) {
+			return notify("Type a range like 100-500");
+		}
+		if (a > b) std::swap(a, b);
+		auto inRange = [&](int f) { return f >= a && f <= b; };
+		size_t before = g_inputs.size();
+		g_inputs.erase(std::remove_if(g_inputs.begin(), g_inputs.end(),
+			[&](MacroInput const& i) { return inRange(i.frame); }), g_inputs.end());
+		g_anchors.erase(std::remove_if(g_anchors.begin(), g_anchors.end(),
+			[&](MacroAnchor const& x) { return inRange(x.frame); }), g_anchors.end());
+		char buf[48];
+		std::snprintf(buf, sizeof(buf), "Removed %d inputs. Tap Save", static_cast<int>(before - g_inputs.size()));
+		notify(buf);
 	}
 
 	void onSpeedSlider(CCObject* sender) {
@@ -807,29 +1259,51 @@ class SettingsPopup : public Popup {
 protected:
 	int m_vals[kSettingCount];
 	int m_page = 0;
+	int m_profile = 1;
 	std::vector<CCNode*> m_pageNodes;
 	std::vector<CCLabelBMFont*> m_valueLabels;
 	CCLabelBMFont* m_pageLabel = nullptr;
+	CCLabelBMFont* m_profLabel = nullptr;
 	CCScale9Sprite* m_preview = nullptr;
 
 	bool init() {
-		if (!Popup::init(350.f, 250.f)) return false;
+		if (!Popup::init(350.f, 270.f)) return false;
 
 		for (int i = 0; i < kSettingCount; i++) m_vals[i] = getSetting(i);
 
+		// profiles
+		auto pPrev = makeButton("<", this, menu_selector(SettingsPopup::onProfPrev), 0.5f);
+		m_buttonMenu->addChildAtPosition(pPrev, Anchor::Center, { -150.f, -68.f });
+		m_profLabel = CCLabelBMFont::create("", "bigFont.fnt");
+		m_profLabel->setScale(0.38f);
+		m_mainLayer->addChildAtPosition(m_profLabel, Anchor::Center, { -105.f, -68.f });
+		auto pNext = makeButton(">", this, menu_selector(SettingsPopup::onProfNext), 0.5f);
+		m_buttonMenu->addChildAtPosition(pNext, Anchor::Center, { -60.f, -68.f });
+		auto pSave = makeButton("Save", this, menu_selector(SettingsPopup::onProfSave), 0.55f);
+		m_buttonMenu->addChildAtPosition(pSave, Anchor::Center, { -10.f, -68.f });
+		auto pLoad = makeButton("Load", this, menu_selector(SettingsPopup::onProfLoad), 0.55f);
+		m_buttonMenu->addChildAtPosition(pLoad, Anchor::Center, { 40.f, -68.f });
+
+		// page nav + apply
 		auto prev = makeButton("<", this, menu_selector(SettingsPopup::onPagePrev), 0.7f);
-		m_buttonMenu->addChildAtPosition(prev, Anchor::Center, { -135.f, -95.f });
+		m_buttonMenu->addChildAtPosition(prev, Anchor::Center, { -135.f, -105.f });
 		m_pageLabel = CCLabelBMFont::create("", "bigFont.fnt");
-		m_pageLabel->setScale(0.45f);
-		m_mainLayer->addChildAtPosition(m_pageLabel, Anchor::Center, { -105.f, -95.f });
+		m_pageLabel->setScale(0.4f);
+		m_mainLayer->addChildAtPosition(m_pageLabel, Anchor::Center, { -85.f, -105.f });
 		auto next = makeButton(">", this, menu_selector(SettingsPopup::onPageNext), 0.7f);
-		m_buttonMenu->addChildAtPosition(next, Anchor::Center, { -75.f, -95.f });
+		m_buttonMenu->addChildAtPosition(next, Anchor::Center, { -35.f, -105.f });
 
 		auto apply = makeButton("Apply", this, menu_selector(SettingsPopup::onApply), 0.8f);
-		m_buttonMenu->addChildAtPosition(apply, Anchor::Center, { 100.f, -95.f });
+		m_buttonMenu->addChildAtPosition(apply, Anchor::Center, { 110.f, -105.f });
 
+		updateProfLabel();
 		buildPage();
 		return true;
+	}
+
+	int val(char const* key) {
+		int i = settingIndex(key);
+		return i < 0 ? 0 : m_vals[i];
 	}
 
 	std::string valueText(int idx) {
@@ -842,11 +1316,16 @@ protected:
 		return buf;
 	}
 
+	void updateProfLabel() {
+		char buf[24];
+		std::snprintf(buf, sizeof(buf), "Profile %d", m_profile);
+		m_profLabel->setString(buf);
+	}
+
 	void buildPage() {
 		for (auto n : m_pageNodes) n->removeFromParent();
 		m_pageNodes.clear();
 		m_valueLabels.clear();
-		m_preview = nullptr;
 
 		char buf[64];
 		std::snprintf(buf, sizeof(buf), "Settings: %s", kPageTitles[m_page]);
@@ -857,7 +1336,7 @@ protected:
 		for (int r = 0; r < kRowsPerPage; r++) {
 			int idx = m_page * kRowsPerPage + r;
 			if (idx >= kSettingCount) break;
-			float y = 62.f - r * 36.f;
+			float y = 72.f - r * 36.f;
 
 			auto title = CCLabelBMFont::create(kSettings[idx].label, "bigFont.fnt");
 			title->setScale(0.4f);
@@ -891,11 +1370,25 @@ protected:
 			m_preview->removeFromParent();
 			m_preview = nullptr;
 		}
-		if (m_page != 0) return;
-		m_preview = makePanel(m_vals[1], m_vals[2], { 60.f, 46.f });
-		m_preview->setOpacity(static_cast<GLubyte>(255 * m_vals[3] / 100));
-		m_mainLayer->addChildAtPosition(m_preview, Anchor::Center, { 128.f, 10.f });
-		m_pageNodes.push_back(m_preview);
+		if (m_page > 2) return;
+		ccColor3B c;
+		int ci = val("ui-color");
+		if (ci >= kColorCount) {
+			c = { static_cast<GLubyte>(val("col-r")), static_cast<GLubyte>(val("col-g")), static_cast<GLubyte>(val("col-b")) };
+		} else {
+			c = kColors[ci].color;
+		}
+		m_preview = makePanel(val("ui-shape"), c, { 60.f, 46.f });
+		m_preview->setOpacity(static_cast<GLubyte>(255 * val("ui-opacity") / 100));
+		m_mainLayer->addChildAtPosition(m_preview, Anchor::Center, { 130.f, 20.f });
+	}
+
+	void applyTheme(int t) {
+		if (t <= 0 || t > 4) return;
+		for (auto p = kThemes[t]; p->key; p++) {
+			int i = settingIndex(p->key);
+			if (i >= 0) m_vals[i] = p->val;
+		}
 	}
 
 	void onStep(CCObject* sender) {
@@ -912,18 +1405,17 @@ protected:
 			v = std::clamp(v + dir * d.step, d.min, d.max);
 		}
 
+		if (std::strcmp(d.key, "ui-theme") == 0) {
+			applyTheme(v);
+			buildPage();
+			return;
+		}
+
 		int row = idx - m_page * kRowsPerPage;
 		if (row >= 0 && row < static_cast<int>(m_valueLabels.size())) {
 			m_valueLabels[row]->setString(valueText(idx).c_str());
 		}
-		if (m_page == 0) {
-			// rebuild only the preview
-			auto old = m_preview;
-			if (old) {
-				m_pageNodes.erase(std::remove(m_pageNodes.begin(), m_pageNodes.end(), old), m_pageNodes.end());
-			}
-			refreshPreview();
-		}
+		refreshPreview();
 	}
 
 	void onPagePrev(CCObject*) {
@@ -934,6 +1426,42 @@ protected:
 	void onPageNext(CCObject*) {
 		m_page = (m_page + 1) % kPageCount;
 		buildPage();
+	}
+
+	void onProfPrev(CCObject*) {
+		m_profile = m_profile == 1 ? 3 : m_profile - 1;
+		updateProfLabel();
+	}
+
+	void onProfNext(CCObject*) {
+		m_profile = m_profile == 3 ? 1 : m_profile + 1;
+		updateProfLabel();
+	}
+
+	void onProfSave(CCObject*) {
+		std::string s;
+		for (int i = 0; i < kSettingCount; i++) s += std::to_string(m_vals[i]) + ",";
+		Mod::get()->setSavedValue<std::string>("profile-" + std::to_string(m_profile), s);
+		Notification::create("Profile saved")->show();
+	}
+
+	void onProfLoad(CCObject*) {
+		auto s = Mod::get()->getSavedValue<std::string>("profile-" + std::to_string(m_profile), "");
+		std::vector<int> vals;
+		std::istringstream in(s);
+		std::string tok;
+		while (std::getline(in, tok, ',')) {
+			if (!tok.empty()) vals.push_back(std::atoi(tok.c_str()));
+		}
+		if (static_cast<int>(vals.size()) != kSettingCount) {
+			Notification::create("Profile is empty")->show();
+			return;
+		}
+		for (int i = 0; i < kSettingCount; i++) {
+			m_vals[i] = std::clamp(vals[i], kSettings[i].min, kSettings[i].max);
+		}
+		buildPage();
+		Notification::create("Profile loaded. Tap Apply")->show();
 	}
 
 	void onApply(CCObject*) {
@@ -968,40 +1496,123 @@ class $modify(GJBaseGameLayer) {
 		GJBaseGameLayer::update(dt);
 		// keep user speed alive through deaths/restarts/time-warp resets
 		enforceSpeed(m_gameState.m_timeWarp);
-		updateClickCounter();
+		updateHud();
+		updatePath();
 	}
 
-	// On-screen click/release counter while recording.
-	void updateClickCounter() {
-		if (!PlayLayer::get() || !m_uiLayer) return;
-		bool show = g_mode == 1 && getInt("counter", 0) != 0;
-		auto node = static_cast<CCLabelBMFont*>(m_uiLayer->getChildByID("macro-click-counter"));
-
-		if (!show) {
-			if (node) node->removeFromParent();
+	// ----- mini HUD -----
+	void updateHud() {
+		if (!m_uiLayer || !PlayLayer::get()) return;
+		auto root = m_uiLayer->getChildByID("macro-hud");
+		if (!S("hud")) {
+			if (root) root->removeFromParent();
 			return;
 		}
-		if (!node) {
-			auto ws = CCDirector::get()->getWinSize();
-			node = CCLabelBMFont::create("", "bigFont.fnt");
-			node->setID("macro-click-counter");
-			node->setScale(0.4f);
-			node->setAnchorPoint({ 0.f, 0.5f });
-			node->setPosition({ 8.f, ws.height - 60.f });
-			node->setOpacity(190);
-			m_uiLayer->addChild(node, 100);
+		if (!root) {
+			root = CCNode::create();
+			root->setID("macro-hud");
+
+			auto bg = CCScale9Sprite::create("square02b_001.png", { 0.f, 0.f, 80.f, 80.f });
+			bg->setColor({ 0, 0, 0 });
+			bg->setOpacity(130);
+			bg->setAnchorPoint({ 0.f, 1.f });
+			bg->setID("bg");
+
+			auto label = CCLabelBMFont::create("", "bigFont.fnt");
+			label->setScale(0.32f);
+			label->setAnchorPoint({ 0.f, 1.f });
+			label->setPosition({ 16.f, -4.f });
+			label->setID("label");
+
+			auto dot = CCDrawNode::create();
+			dot->drawDot({ 0.f, 0.f }, 4.f, ccc4f(1.f, 0.15f, 0.15f, 1.f));
+			dot->setPosition({ 8.f, -9.f });
+			dot->setID("dot");
+
+			root->addChild(bg);
+			root->addChild(label, 1);
+			root->addChild(dot, 2);
+			m_uiLayer->addChild(root, 150);
 		}
-		static size_t cached = static_cast<size_t>(-1);
-		if (cached != g_inputs.size() || std::string(node->getString()).empty()) {
-			cached = g_inputs.size();
+
+		auto bg = static_cast<CCScale9Sprite*>(root->getChildByID("bg"));
+		auto label = static_cast<CCLabelBMFont*>(root->getChildByID("label"));
+		auto dot = root->getChildByID("dot");
+		if (!bg || !label || !dot) return;
+
+		std::string text = g_mode == 1 ? "REC" : (g_mode == 2 ? "PLAY" : "IDLE");
+		if (S("hud-frame")) text += "\nFrame " + std::to_string(g_frame);
+		if (S("hud-corr") && g_mode == 2) text += "\nFixes " + std::to_string(g_corrections);
+		if (S("counter") && g_mode == 1) {
 			int clicks = 0, releases = 0;
 			for (auto& i : g_inputs) {
 				if (i.down) clicks++;
 				else releases++;
 			}
-			char buf[64];
-			std::snprintf(buf, sizeof(buf), "Clicks %d / Releases %d", clicks, releases);
-			node->setString(buf);
+			text += "\nClicks " + std::to_string(clicks) + " / " + std::to_string(releases);
+		}
+
+		if (text != std::string(label->getString())) {
+			label->setString(text.c_str());
+			auto size = label->getScaledContentSize();
+			bg->setContentSize({ size.width + 22.f, size.height + 8.f });
+		}
+
+		dot->setVisible(g_mode == 1 && S("hud-dot") != 0);
+		dot->setScale(0.85f + 0.25f * std::sin(g_frame * 0.08f));
+
+		auto ws = CCDirector::get()->getWinSize();
+		auto sz = bg->getContentSize();
+		int corner = std::clamp(S("hud-pos"), 0, 3);
+		bool left = (corner == 1 || corner == 3);
+		bool topSide = corner >= 2;
+		float x = left ? 6.f : ws.width - sz.width - 6.f;
+		float y = topSide ? ws.height - 6.f : sz.height + 6.f;
+		root->setPosition({ x, y });
+	}
+
+	// ----- pathfinder overlay -----
+	void updatePath() {
+		if (!m_objectLayer || !PlayLayer::get()) return;
+		int mode = S("pf-mode");
+		bool route = (mode == 1 || mode == 3) && g_mode == 2 && !g_anchors.empty();
+		bool trail = (mode == 2 || mode == 3) && g_mode == 1 && !g_anchors.empty();
+		auto node = static_cast<CCDrawNode*>(m_objectLayer->getChildByID("macro-path"));
+
+		if (!route && !trail) {
+			if (node) node->clear();
+			g_pathKey = static_cast<size_t>(-1);
+			return;
+		}
+		if (!node) {
+			node = CCDrawNode::create();
+			node->setID("macro-path");
+			m_objectLayer->addChild(node, 500);
+			g_pathDirty = true;
+		}
+
+		size_t key = (route ? g_anchorCursor : g_anchors.size()) * 2 + (route ? 1 : 0);
+		if (key == g_pathKey && !g_pathDirty) return;
+		g_pathKey = key;
+		g_pathDirty = false;
+		node->clear();
+
+		auto ac = accentColor();
+		ccColor4F col = ccc4f(ac.r / 255.f, ac.g / 255.f, ac.b / 255.f, 0.85f);
+		ccColor4F col2 = ccc4f(ac.r / 255.f, ac.g / 255.f, ac.b / 255.f, 0.5f);
+		float w = S("pf-width") * 0.6f;
+		bool dots = S("pf-dots") != 0;
+		static const int aheadVals[] = { 0, 100, 300, 600 };
+		int ahead = aheadVals[std::clamp(S("pf-ahead"), 0, 3)];
+
+		size_t start = (route && g_anchorCursor > 0) ? g_anchorCursor - 1 : 0;
+		for (size_t i = start + 1; i < g_anchors.size(); i++) {
+			auto& a = g_anchors[i - 1];
+			auto& b = g_anchors[i];
+			if (route && ahead > 0 && b.frame > g_frame + ahead) break;
+			node->drawSegment({ a.x1, a.y1 }, { b.x1, b.y1 }, w, col);
+			if (a.dual && b.dual) node->drawSegment({ a.x2, a.y2 }, { b.x2, b.y2 }, w, col2);
+			if (dots) node->drawDot({ b.x1, b.y1 }, w * 1.6f, col);
 		}
 	}
 
@@ -1060,6 +1671,7 @@ class $modify(GJBaseGameLayer) {
 
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		int frame = static_cast<int>(m_gameState.m_currentProgress);
+		g_frame = frame;
 		if (g_mode == 1) {
 			recordAnchor(frame);
 		}
@@ -1078,8 +1690,7 @@ class $modify(GJBaseGameLayer) {
 
 class $modify(PlayLayer) {
 	void resetLevel() {
-		// auto-save the run before it gets cleared on death/restart
-		if (g_mode == 1 && getInt("autosave", 0) && !g_inputs.empty() && !g_selected.empty()) {
+		if (g_mode == 1 && S("autosave") && !g_inputs.empty() && !g_selected.empty()) {
 			writeMacro(g_selected);
 		}
 		PlayLayer::resetLevel();
@@ -1091,6 +1702,7 @@ class $modify(PlayLayer) {
 		g_anchorCursor = 0;
 		g_lastAnchorFrame = -1;
 		g_corrections = 0;
+		g_pathDirty = true;
 		enforceSpeed(m_gameState.m_timeWarp);
 	}
 
@@ -1107,8 +1719,7 @@ class $modify(PlayLayer) {
 			}
 			g_mode = 0;
 		} else if (g_mode == 2) {
-			if (getInt("loop", 0)) {
-				// restart immediately instead of showing the end screen
+			if (S("loop")) {
 				g_cursor = 0;
 				g_anchorCursor = 0;
 				g_corrections = 0;
@@ -1124,7 +1735,8 @@ class $modify(PlayLayer) {
 	}
 
 	void onQuit() {
-		if (!getInt("keep-speed", 0)) resetSpeed();
+		if (!S("keep-speed")) resetSpeed();
+		g_pathKey = static_cast<size_t>(-1);
 		PlayLayer::onQuit();
 	}
 };
@@ -1133,7 +1745,7 @@ class $modify(MacroPause, PauseLayer) {
 	void customSetup() {
 		PauseLayer::customSetup();
 		auto ws = CCDirector::get()->getWinSize();
-		int corner = std::clamp(getInt("pause-corner", 0), 0, 3);
+		int corner = std::clamp(S("pause-corner"), 0, 3);
 		float x = (corner == 1 || corner == 3) ? 60.f : ws.width - 60.f;
 		float y = (corner >= 2) ? ws.height - 40.f : 40.f;
 

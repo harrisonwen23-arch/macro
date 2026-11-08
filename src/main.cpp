@@ -77,6 +77,45 @@ static std::string cleanName(std::string const& s) {
 	return out;
 }
 
+static std::string nextMacroName() {
+	std::string name;
+	for (int n = 1; n < 10000; n++) {
+		name = "Macro " + std::to_string(n);
+		if (!std::filesystem::exists(macroFile(name))) break;
+	}
+	return name;
+}
+
+static void showSavedBox(std::string const& text) {
+	auto scene = CCDirector::get()->getRunningScene();
+	if (!scene) return;
+	auto ws = CCDirector::get()->getWinSize();
+
+	auto label = CCLabelBMFont::create(text.c_str(), "bigFont.fnt");
+	label->setScale(0.45f);
+	auto size = label->getScaledContentSize();
+
+	auto bg = CCScale9Sprite::create("square02b_001.png", { 0.f, 0.f, 80.f, 80.f });
+	bg->setColor({ 0, 0, 0 });
+	bg->setOpacity(153); // 60%
+	bg->setContentSize({ size.width + 24.f, size.height + 16.f });
+
+	auto node = CCNode::create();
+	node->setPosition({ ws.width / 2.f, ws.height - 28.f });
+	node->addChild(bg);
+	node->addChild(label, 1);
+
+	bg->runAction(CCSequence::create(CCDelayTime::create(2.f), CCFadeTo::create(0.5f, 0), nullptr));
+	label->runAction(CCSequence::create(CCDelayTime::create(2.f), CCFadeTo::create(0.5f, 0), nullptr));
+	node->runAction(CCSequence::create(
+		CCDelayTime::create(2.6f),
+		CCCallFunc::create(node, callfunc_selector(CCNode::removeFromParent)),
+		nullptr
+	));
+
+	scene->addChild(node, 10000);
+}
+
 class MacroPopup : public Popup {
 protected:
 	CCLabelBMFont* m_modeLabel = nullptr;
@@ -88,15 +127,18 @@ protected:
 
 	bool init() {
 		auto ws = CCDirector::get()->getWinSize();
-		if (!Popup::init(ws.width, ws.height)) return false;
+		float pw = ws.width * 0.9f;
+		float ph = ws.height * 0.9f;
+		if (!Popup::init(pw, ph)) return false;
 
 		this->setTitle("Macro Manager");
 
-		float leftX = -ws.width * 0.2f;
-		float rightX = ws.width * 0.26f;
-		m_listW = ws.width * 0.47f;
-		float listH = ws.height - 110.f;
-		float listY = -10.f;
+		float leftX = -pw * 0.23f;
+		float rightX = pw * 0.25f;
+		m_listW = pw * 0.44f;
+		float listH = ph - 80.f;
+		float listY = -12.f;
+		float top = ph / 2.f;
 
 		auto bg = CCScale9Sprite::create("square02b_001.png", { 0.f, 0.f, 80.f, 80.f });
 		bg->setColor({ 0, 0, 0 });
@@ -110,27 +152,33 @@ protected:
 		m_list->m_contentLayer->setLayout(ScrollLayer::createDefaultListLayout());
 		m_mainLayer->addChildAtPosition(m_list, Anchor::Center, { leftX, listY });
 
-		m_modeLabel = addLabel("", rightX, 110.f, 0.55f);
+		float y = top - 52.f;
+		m_modeLabel = addLabel("", rightX, y, 0.65f);
 
-		addBtn("Record", menu_selector(MacroPopup::onRecord), rightX - 75.f, 85.f);
-		addBtn("Play", menu_selector(MacroPopup::onPlay), rightX, 85.f);
-		addBtn("Off", menu_selector(MacroPopup::onOff), rightX + 60.f, 85.f);
+		y -= 34.f;
+		addBtn("Record", menu_selector(MacroPopup::onRecord), rightX - 55.f, y, 0.7f);
+		addBtn("Play", menu_selector(MacroPopup::onPlay), rightX + 21.f, y, 0.7f);
+		addBtn("Off", menu_selector(MacroPopup::onOff), rightX + 81.f, y, 0.7f);
 
-		m_selLabel = addLabel("", rightX, 55.f, 0.45f);
+		y -= 34.f;
+		m_selLabel = addLabel("", rightX, y, 0.5f);
 
-		m_input = TextInput::create(140.f, "New name");
+		y -= 36.f;
+		m_input = TextInput::create(130.f, "New name");
 		m_input->setMaxCharCount(24);
-		m_mainLayer->addChildAtPosition(m_input, Anchor::Center, { rightX - 40.f, 28.f });
-		addBtn("Rename", menu_selector(MacroPopup::onRename), rightX + 80.f, 28.f);
+		m_mainLayer->addChildAtPosition(m_input, Anchor::Center, { rightX - 45.f, y });
+		addBtn("Rename", menu_selector(MacroPopup::onRename), rightX + 72.f, y, 0.7f);
 
-		addBtn("Save", menu_selector(MacroPopup::onSave), rightX - 93.f, 0.f);
-		addBtn("Load", menu_selector(MacroPopup::onLoad), rightX - 31.f, 0.f);
-		addBtn("Delete", menu_selector(MacroPopup::onDelete), rightX + 31.f, 0.f);
-		addBtn("New", menu_selector(MacroPopup::onNew), rightX + 93.f, 0.f);
+		y -= 34.f;
+		addBtn("Save", menu_selector(MacroPopup::onSave), rightX - 88.f, y, 0.62f);
+		addBtn("Load", menu_selector(MacroPopup::onLoad), rightX - 33.f, y, 0.62f);
+		addBtn("Delete", menu_selector(MacroPopup::onDelete), rightX + 30.f, y, 0.62f);
+		addBtn("New", menu_selector(MacroPopup::onNew), rightX + 91.f, y, 0.62f);
 
-		addBtn("-", menu_selector(MacroPopup::onSpeedDown), rightX - 70.f, -40.f);
-		m_speedLabel = addLabel("", rightX, -40.f, 0.5f);
-		addBtn("+", menu_selector(MacroPopup::onSpeedUp), rightX + 70.f, -40.f);
+		y -= 38.f;
+		addBtn("-", menu_selector(MacroPopup::onSpeedDown), rightX - 85.f, y, 0.8f);
+		m_speedLabel = addLabel("", rightX, y, 0.6f);
+		addBtn("+", menu_selector(MacroPopup::onSpeedUp), rightX + 85.f, y, 0.8f);
 
 		rebuildList();
 		refreshLabels();
@@ -144,9 +192,9 @@ protected:
 		return label;
 	}
 
-	CCMenuItemSpriteExtra* addBtn(char const* text, SEL_MenuHandler cb, float x, float y) {
+	CCMenuItemSpriteExtra* addBtn(char const* text, SEL_MenuHandler cb, float x, float y, float scale) {
 		auto btn = CCMenuItemSpriteExtra::create(ButtonSprite::create(text), this, cb);
-		btn->setScale(0.55f);
+		btn->setScale(scale);
 		m_buttonMenu->addChildAtPosition(btn, Anchor::Center, { x, y });
 		return btn;
 	}
@@ -157,7 +205,7 @@ protected:
 
 		auto names = listMacros();
 		if (names.empty()) {
-			auto label = CCLabelBMFont::create("No macros yet. Tap New.", "bigFont.fnt");
+			auto label = CCLabelBMFont::create("No macros yet. Tap Record.", "bigFont.fnt");
 			label->setScale(0.5f);
 			content->addChild(label);
 		}
@@ -187,7 +235,9 @@ protected:
 		char const* modes[] = { "Mode: Off", "Mode: Recording", "Mode: Playing" };
 		m_modeLabel->setString(modes[g_mode]);
 
-		std::string sel = g_selected.empty() ? "Selected: none" : "Selected: " + g_selected;
+		std::string shown = g_selected;
+		if (shown.size() > 18) shown = shown.substr(0, 17) + "...";
+		std::string sel = g_selected.empty() ? "Selected: none" : "Selected: " + shown;
 		m_selLabel->setString(sel.c_str());
 
 		char buf[32];
@@ -209,7 +259,9 @@ protected:
 	}
 
 	void onRecord(CCObject*) {
+		g_selected = nextMacroName();
 		g_inputs.clear();
+		writeMacro(g_selected);
 		g_mode = 1;
 		notify("Recording: restart the level");
 		this->keyBackClicked();
@@ -227,13 +279,16 @@ protected:
 	}
 
 	void onOff(CCObject*) {
+		if (g_mode == 1 && !g_selected.empty() && !g_inputs.empty()) {
+			writeMacro(g_selected);
+			notify("Macro saved");
+		}
 		g_mode = 0;
 		refreshLabels();
-		notify("Macro off");
 	}
 
 	void onSave(CCObject*) {
-		if (g_selected.empty()) return notify("Tap New or pick a macro first");
+		if (g_selected.empty()) return notify("Tap Record or pick a macro first");
 		if (g_inputs.empty()) return notify("Nothing recorded yet");
 		notify(writeMacro(g_selected) ? "Macro saved" : "Save failed");
 	}
@@ -258,15 +313,10 @@ protected:
 	}
 
 	void onNew(CCObject*) {
-		std::string name;
-		for (int n = 1; n < 1000; n++) {
-			name = "Macro " + std::to_string(n);
-			if (!std::filesystem::exists(macroFile(name))) break;
-		}
 		g_inputs.clear();
-		g_selected = name;
-		writeMacro(name);
-		m_input->setString(name);
+		g_selected = nextMacroName();
+		writeMacro(g_selected);
+		m_input->setString(g_selected);
 		rebuildList();
 		refreshLabels();
 	}
@@ -344,6 +394,24 @@ class $modify(PlayLayer) {
 		PlayLayer::resetLevel();
 		if (g_mode == 1) g_inputs.clear();
 		g_cursor = 0;
+	}
+
+	void levelComplete() {
+		if (g_mode == 1 && !g_inputs.empty()) {
+			if (g_selected.empty()) g_selected = nextMacroName();
+			int clicks = 0, releases = 0;
+			for (auto& i : g_inputs) {
+				if (i.down) clicks++;
+				else releases++;
+			}
+			if (writeMacro(g_selected)) {
+				showSavedBox("Macro saved (" + std::to_string(clicks) + " clicks / " + std::to_string(releases) + " releases)");
+			}
+			g_mode = 0;
+		} else if (g_mode == 2) {
+			g_mode = 0;
+		}
+		PlayLayer::levelComplete();
 	}
 
 	void onQuit() {

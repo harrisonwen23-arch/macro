@@ -24,7 +24,10 @@
 
 using namespace geode::prelude;
 
-struct MacroInput { int frame; int button; bool down; bool p1; };
+// sub = which processCommands call inside that step applied the input (0 = first). Presses and
+// releases both carry it, so an input that the game applied in a later half-tick of a step is
+// replayed in that same half-tick instead of at the start of the step.
+struct MacroInput { int frame; int button; bool down; bool p1; int sub = 0; };
 
 struct MacroAnchor {
 	int frame;
@@ -56,6 +59,9 @@ static size_t g_pathKey = static_cast<size_t>(-1);
 // the step of the next processCommands call, which is the step that really applies them.
 static bool g_inCmd = false;
 static std::vector<size_t> g_pendStamp;
+static int g_lastRawStep = -1;  // step counter seen by the previous processCommands call
+static int g_callIdx = 0;       // which processCommands call of the current step this is (0 = first)
+static std::string g_divNear;   // inputs close to the first desync, for the report
 
 // divergence finder: where playback first stops matching the recording
 static int g_divFrame = -1;     // first frame that differs by more than the limit (-1 = none yet)
@@ -468,14 +474,16 @@ static std::vector<std::string> listMacros() {
 
 // Format (one item per line):
 //   T <epoch>                                                  -> saved time
-//   <frame> <button> <down 0/1> <p1 0/1>                      -> input
+//   <frame> <button> <down 0/1> <p1 0/1> [sub-step]          -> input (press or release)
 //   A <frame> <x1> <y1> <v1> <dual 0/1> <x2> <y2> <v2>        -> anchor
 //   W <input index> <early frames> <late frames>              -> click window
 static void serializeMacro(std::ostream& out) {
 	out << std::setprecision(9);
 	out << "T " << static_cast<long long>(std::time(nullptr)) << '\n';
 	for (auto& i : g_inputs) {
-		out << i.frame << ' ' << i.button << ' ' << (i.down ? 1 : 0) << ' ' << (i.p1 ? 1 : 0) << '\n';
+		out << i.frame << ' ' << i.button << ' ' << (i.down ? 1 : 0) << ' ' << (i.p1 ? 1 : 0);
+		if (i.sub != 0) out << ' ' << i.sub;
+		out << '\n';
 	}
 	for (auto& a : g_anchors) {
 		out << "A " << a.frame << ' ' << a.x1 << ' ' << a.y1 << ' ' << a.v1 << ' '
@@ -508,8 +516,10 @@ static void parseMacro(std::istream& in, std::vector<MacroInput>& inputs, std::v
 		} else {
 			std::istringstream s(line);
 			int frame, button, down, p1;
+			int sub = 0;
 			if (s >> frame >> button >> down >> p1) {
-				inputs.push_back({ frame, button, down != 0, p1 != 0 });
+				if (!(s >> sub)) sub = 0;
+				inputs.push_back({ frame, button, down != 0, p1 != 0, sub });
 			}
 		}
 	}
@@ -2232,6 +2242,16 @@ static void divCheck(PlayerObject* p, int frame, float x, float y, int which) {
 			g_divDx = dx;
 			g_divDy = dy;
 			g_divWhich = which;
+			// the position at this frame was decided by inputs just before it: list them
+			g_divNear.clear();
+			int shown = 0;
+			for (auto& in : g_inputs) {
+				if (in.frame < frame - 8 || in.frame > frame) continue;
+				if (shown++ >= 6) break;
+				g_divNear += std::string(g_divNear.empty() ? "" : " ") + (in.down ? "PRESS@" : "RELEASE@") + std::to_string(in.frame);
+				if (in.sub) g_divNear += "." + std::to_string(in.sub);
+				if (!in.p1) g_divNear += "(p2)";
+			}
 		}
 	}
 }
@@ -2245,6 +2265,7 @@ static void divReset() {
 	g_divChecked = 0;
 	g_divMax = 0.f;
 	g_divReported = false;
+	g_divNear.clear();
 }
 
 // ---------- hooks ----------
@@ -2584,6 +2605,7 @@ class $modify(GJBaseGameLayer) {
 			in.button = static_cast<int>(button);
 			in.down = down;
 			in.p1 = p1;
+			in.sub = (exact && g_inCmd) ? g_callIdx : 0;
 			g_inputs.push_back(in);
 			// arrived outside processCommands: it is applied on the next step, so stamp it then
 			if (exact && !g_inCmd) g_pendStamp.push_back(g_inputs.size() - 1);
@@ -2671,6 +2693,9 @@ class $modify(GJBaseGameLayer) {
 
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		int frame = static_cast<int>(m_gameState.m_currentProgress);
+		// which call of this step is this? (the step counter stays the same across half-ticks)
+		if (frame != g_lastRawStep) { g_lastRawStep = frame; g_callIdx = 0; }
+		else g_callIdx++;
 		if (g_mode == 3) {
 			if (g_spNeedBase) {
 				g_spNeedBase = false;
@@ -2694,7 +2719,10 @@ class $modify(GJBaseGameLayer) {
 		g_frame = frame;
 		if (g_mode == 1 && !g_pendStamp.empty()) {
 			for (auto idx : g_pendStamp) {
-				if (idx < g_inputs.size()) g_inputs[idx].frame = frame;
+				if (idx < g_inputs.size()) {
+					g_inputs[idx].frame = frame;
+					g_inputs[idx].sub = g_callIdx;
+				}
 			}
 			g_pendStamp.clear();
 		}
@@ -2744,7 +2772,7 @@ class $modify(GJBaseGameLayer) {
 			// solver: replay the proven route exactly, then explore past its end
 			if (g_mode == 4 && frame < g_sol.frame) applyAnchors(frame);
 			auto& src = (g_mode == 3 || g_mode == 4) ? g_work : g_inputs;
-			while (g_cursor < src.size() && src[g_cursor].frame <= frame) {
+			while (g_cursor < src.size() && (src[g_cursor].frame < frame || (src[g_cursor].frame == frame && src[g_cursor].sub <= g_callIdx))) {
 				auto i = src[g_cursor++];
 				g_injecting = true;
 				GJBaseGameLayer::handleButton(i.down, i.button, i.p1);
@@ -2811,6 +2839,8 @@ class $modify(PlayLayer) {
 		g_corrections = 0;
 		g_pathDirty = true;
 		g_pendStamp.clear();
+		g_lastRawStep = -1;
+		g_callIdx = 0;
 		if (g_mode == 2) divReset();
 		g_diagPending = (g_mode == 3 || g_mode == 4);
 		if (m_objectLayer) {
@@ -2887,7 +2917,9 @@ class $modify(PlayLayer) {
 			} else {
 				std::snprintf(b, sizeof(b), "\nNo desync before death (max offset %.3f)", g_divMax);
 			}
-			showSavedBox(msg + b);
+			msg += b;
+			if (g_divFrame >= 0) msg += "\nInputs just before it: " + (g_divNear.empty() ? std::string("none") : g_divNear);
+			showSavedBox(msg);
 		}
 		{
 			bool fresh = (g_mode == 3) ? (g_wt.active && !g_wt.resolved) : (g_mode == 4 && g_sol.active && !g_sol.resolved);
@@ -2968,6 +3000,7 @@ class $modify(PlayLayer) {
 						std::snprintf(b, sizeof(b), "\nNo desync found (max offset %.3f)", g_divMax);
 					}
 					m += b;
+					if (g_divFrame >= 0) m += "\nInputs just before it: " + (g_divNear.empty() ? std::string("none") : g_divNear);
 				}
 				showSavedBox(m);
 			}

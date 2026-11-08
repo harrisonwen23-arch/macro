@@ -16,6 +16,8 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <array>
+#include <type_traits>
 #include <utility>
 #include <filesystem>
 #include <system_error>
@@ -57,6 +59,25 @@ static std::string g_diag;       // player state on the first step after a resta
 static std::string g_diagDeath;  // player/object state at the last death
 static bool g_diagPending = false;
 
+// ---------- save points for the window test ----------
+struct SavePoint { int frame; CheckpointObject* cp; };
+static std::vector<SavePoint> g_sps;
+static std::vector<std::array<float, 2>> g_baseTrace; // player x/y at every frame of the baseline run
+static int g_frameBase = 0;      // frame = game progress + this (only while a save point is loaded)
+static bool g_spNeedBase = false;
+static int g_spExpect = 0;       // frame the loaded save point stands for
+static int g_spVerify = 0;       // steps left to compare against the baseline
+static int g_spStrategy = 0;     // 0 = plain load, 1 = also restore the held button
+
+// window test runs at its own speed, then the old speed is put back
+static float g_wtSavedSpeed = 1.f;
+static bool g_wtSavedTouched = false;
+static bool g_wtSpeedSet = false;
+
+// window counter tally: how many clicks of each window size were passed this run
+static int g_tally[7] = { 0, 0, 0, 0, 0, 0, 0 };
+static size_t g_tallyCursor = 0;
+
 // ---------- frame windows ----------
 // For every click (input index) the number of frames it can be pressed
 // earlier / later and still survive. Saved in the macro file as "W" lines.
@@ -77,6 +98,8 @@ struct WinTest {
 	bool lastOk = false;
 	bool pendingReset = false;
 	bool pendingAdvance = false;
+	int sp = -1;         // save point used by the current attempt (-1 = none)
+	bool spOk = true;    // false once save points proved unreliable for this test
 };
 static WinTest g_wt;
 static std::vector<MacroInput> g_work; // macro with the tested click shifted
@@ -112,7 +135,7 @@ static Solver g_sol;
 static const int kSolCands = 13;
 
 static constexpr float kSpeedMin = 0.1f;
-static constexpr float kSpeedMax = 30.f;
+static constexpr float kSpeedMax = 5.f;
 
 // ---------- palettes ----------
 
@@ -160,6 +183,7 @@ static char const* const kNameFmtNames[] = { "Numbered", "Always numbered", "Wit
 static char const* const kPfModeNames[] = { "Off", "Route", "Trail", "Both" };
 static char const* const kAheadNames[] = { "All", "100 frames", "300 frames", "600 frames" };
 static char const* const kSortNames[] = { "Name", "Newest", "Longest" };
+static char const* const kStyleNames[] = { "Classic", "Tally" };
 
 struct SettingDef {
 	char const* key;
@@ -229,39 +253,19 @@ static const SettingDef kSettings[] = {
 	// page 11: auto solver
 	{ "solve-tries", "Max tries", 500, 20000, 500, 20000, nullptr, 1, "" },
 	{ "solve-tap", "Tap length", 2, 10, 1, 3, nullptr, 1, "f" },
-	{ "speed-audio", "Speed audio", 0, 1, 1, 1, kOffOn, 1, "" },
+	{ "win-style", "Counter style", 0, 1, 1, 1, kStyleNames, 1, "" },
+	{ "win-ring", "Click rings", 0, 1, 1, 1, kOffOn, 1, "" },
+	// page 12: test run
 	{ "win-save", "Save points", 0, 1, 1, 1, kOffOn, 1, "" },
-	// page 12: hitboxes
-	{ "hb-show", "Show hitbox", 0, 1, 1, 0, kOffOn, 1, "" },
-	{ "hb-fill", "Fill opacity", 0, 100, 10, 20, nullptr, 1, "%" },
-	{ "hb-width", "Line width", 1, 4, 1, 2, nullptr, 1, "" },
-	{ "hb-range", "View range", 200, 1500, 100, 600, nullptr, 1, "" },
-	// page 13: player colour
-	{ "hb-pr", "Player red", 0, 255, 15, 255, nullptr, 1, "" },
-	{ "hb-pg", "Player green", 0, 255, 15, 255, nullptr, 1, "" },
-	{ "hb-pb", "Player blue", 0, 255, 15, 0, nullptr, 1, "" },
-	{ "hb-inner", "Inner box", 0, 1, 1, 1, kOffOn, 1, "" },
-	// page 14: hazard colour
-	{ "hb-hr", "Hazard red", 0, 255, 15, 255, nullptr, 1, "" },
-	{ "hb-hg", "Hazard green", 0, 255, 15, 0, nullptr, 1, "" },
-	{ "hb-hb", "Hazard blue", 0, 255, 15, 0, nullptr, 1, "" },
-	{ "hb-hz", "Show hazards", 0, 1, 1, 1, kOffOn, 1, "" },
-	// page 15: solid colour
-	{ "hb-sr", "Solid red", 0, 255, 15, 0, nullptr, 1, "" },
-	{ "hb-sg", "Solid green", 0, 255, 15, 120, nullptr, 1, "" },
-	{ "hb-sb", "Solid blue", 0, 255, 15, 255, nullptr, 1, "" },
-	{ "hb-sol", "Show solids", 0, 1, 1, 1, kOffOn, 1, "" },
-	// page 16: special colour (pads, orbs, portals, coins)
-	{ "hb-xr", "Special red", 0, 255, 15, 0, nullptr, 1, "" },
-	{ "hb-xg", "Special green", 0, 255, 15, 255, nullptr, 1, "" },
-	{ "hb-xb", "Special blue", 0, 255, 15, 0, nullptr, 1, "" },
-	{ "hb-spc", "Show special", 0, 1, 1, 1, kOffOn, 1, "" },
+	{ "win-gap", "Save gap", 60, 300, 20, 120, nullptr, 1, "f" },
+	{ "win-speed", "Test speed", 1, 10, 1, 4, nullptr, 1, "x" },
+	{ "pitch", "Audio pitch", 0, 1, 1, 1, kOffOn, 1, "" },
 };
-static const int kSettingCount = 68;
+static const int kSettingCount = 52;
 static const int kRowsPerPage = 4;
-static const int kPageCount = 17;
+static const int kPageCount = 13;
 static char const* const kPageTitles[] = {
-	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder", "Window", "Route", "Solver", "Hitbox", "Hit player", "Hit hazard", "Hit solid", "Hit special"
+	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder", "Window", "Route", "Solver / Window", "Test run"
 };
 
 struct ThemeVal { char const* key; int val; };
@@ -350,41 +354,69 @@ static void fitLabel(CCLabelBMFont* label, float maxW, float scale) {
 
 // ---------- speed ----------
 
-// Slows / speeds up all game audio together with the speed hack (FMOD master pitch).
-static void setAudioPitch(float pitch) {
-	auto fe = FMODAudioEngine::sharedEngine();
-	if (!fe || !fe->m_system) return;
-	FMOD::ChannelGroup* group = nullptr;
-	if (fe->m_system->getMasterChannelGroup(&group) == FMOD_OK && group) {
-		group->setPitch(std::clamp(pitch, 0.1f, 10.f));
-	}
-}
-
-static float audioPitch() {
-	if (!S("speed-audio")) return 1.f;
-	return g_speed;
-}
-
 // GD resets the scheduler time scale on level restart, so re-apply every
 // frame, multiplied by the level's own time warp.
+// Slows / speeds the game's audio together with the speed hack. If the game's
+// audio API looks different, this quietly does nothing instead of breaking the build.
+static void applyPitch(float pitch) {
+	auto eng = FMODAudioEngine::sharedEngine();
+	if (!eng) return;
+	[&](auto* e) {
+		if constexpr (requires(FMOD::ChannelGroup* g) { e->m_system->getMasterChannelGroup(&g); g->setPitch(1.f); }) {
+			FMOD::ChannelGroup* g = nullptr;
+			e->m_system->getMasterChannelGroup(&g);
+			if (g) g->setPitch(pitch);
+		}
+	}(eng);
+}
+
+// test and solver runs use their own speed, so the audio is left alone there
+static float pitchFor() {
+	return (S("pitch") != 0 && g_mode != 3 && g_mode != 4) ? g_speed : 1.f;
+}
+
 static void enforceSpeed(float timeWarp) {
 	if (!g_speedTouched) return;
 	if (timeWarp <= 0.f) timeWarp = 1.f;
 	CCDirector::get()->getScheduler()->setTimeScale(g_speed * timeWarp);
-	setAudioPitch(audioPitch());
+	applyPitch(pitchFor());
 }
 
 static void applySpeed() {
 	g_speedTouched = true;
 	CCDirector::get()->getScheduler()->setTimeScale(g_speed);
-	setAudioPitch(audioPitch());
+	applyPitch(pitchFor());
 }
 
 static void resetSpeed() {
 	g_speed = 1.f;
 	g_speedTouched = false;
 	CCDirector::get()->getScheduler()->setTimeScale(1.f);
-	setAudioPitch(1.f);
+	applyPitch(1.f);
+}
+
+static void wtBeginSpeed() {
+	if (!g_wtSpeedSet) {
+		g_wtSavedSpeed = g_speed;
+		g_wtSavedTouched = g_speedTouched;
+		g_wtSpeedSet = true;
+	}
+	int x = S("win-speed");
+	if (x > 1) {
+		g_speed = static_cast<float>(x);
+		applySpeed();
+	}
+}
+
+static void wtRestoreSpeed() {
+	if (!g_wtSpeedSet) return;
+	g_wtSpeedSet = false;
+	if (g_wtSavedTouched) {
+		g_speed = g_wtSavedSpeed;
+		applySpeed();
+	} else {
+		resetSpeed();
+	}
 }
 
 // ---------- macro files ----------
@@ -618,6 +650,52 @@ static void showSavedBox(std::string const& text) {
 
 // ---------- window test engine ----------
 
+// The game's checkpoint functions are looked up in a way that compiles even if they
+// are named differently: then save points simply stay off.
+static CheckpointObject* spCreate(PlayLayer* pl) {
+	return [](auto* p) -> CheckpointObject* {
+		if constexpr (requires { p->createCheckpoint(); }) {
+			auto r = p->createCheckpoint();
+			if constexpr (std::is_convertible_v<decltype(r), CheckpointObject*>) return r;
+			else return nullptr;
+		} else {
+			return nullptr;
+		}
+	}(pl);
+}
+
+static bool spLoad(PlayLayer* pl, CheckpointObject* cp) {
+	return [](auto* p, CheckpointObject* c) -> bool {
+		if constexpr (requires { p->loadFromCheckpoint(c); }) {
+			p->loadFromCheckpoint(c);
+			return true;
+		} else {
+			return false;
+		}
+	}(pl, cp);
+}
+
+static void spClear() {
+	for (auto& s : g_sps) if (s.cp) s.cp->release();
+	g_sps.clear();
+	g_baseTrace.clear();
+	g_frameBase = 0;
+	g_spNeedBase = false;
+	g_spVerify = 0;
+}
+
+// A loaded save point did not match the baseline run. Try the other way of loading it
+// once; if that fails too, stop using save points and redo the attempt from the start.
+static void spFail() {
+	g_spVerify = 0;
+	if (g_spStrategy == 0) g_spStrategy = 1;
+	else g_wt.spOk = false;
+	g_wt.sp = -1;
+	g_wt.resolved = true;
+	g_wt.pendingReset = true;
+	g_wt.pendingAdvance = false;
+}
+
 static void wtResolve(bool ok) {
 	if (!g_wt.active || g_wt.resolved) return;
 	g_wt.resolved = true;
@@ -664,13 +742,10 @@ static int wtAdvance() {
 		// that happen before the frame where it dies
 		std::vector<int> keep;
 		for (int ci : g_wt.clicks) {
-			if (ci < 0 || ci >= static_cast<int>(g_inputs.size()) || g_inputs[ci].frame >= g_wt.baseEnd) continue;
-			// save points: clicks that already have a saved window are skipped
-			if (S("win-save") && g_windows.count(ci)) continue;
-			keep.push_back(ci);
+			if (ci >= 0 && ci < static_cast<int>(g_inputs.size()) && g_inputs[ci].frame < g_wt.baseEnd) keep.push_back(ci);
 		}
 		g_wt.clicks = keep;
-		if (g_wt.clicks.empty()) return g_windows.empty() ? -1 : 0;
+		if (g_wt.clicks.empty()) return -1;
 		g_wt.ci = 0;
 		g_wt.phase = 1;
 		g_wt.s = 1;
@@ -690,8 +765,6 @@ static int wtAdvance() {
 	if (lateOk) g_wt.late = g_wt.s;
 	if (lateOk && g_wt.s < maxS) { g_wt.s++; return 1; }
 	g_windows[clickIdx] = { g_wt.early, g_wt.late };
-	// save point: write the progress to the macro file after every click
-	if (S("win-save") && !g_selected.empty()) writeMacro(g_selected);
 	g_wt.ci++;
 	if (g_wt.ci >= g_wt.clicks.size()) return 0;
 	g_wt.phase = 1;
@@ -703,17 +776,20 @@ static int wtAdvance() {
 
 static void wtFinish(bool aborted) {
 	g_mode = 0;
+	wtRestoreSpeed();
+	spClear();
 	g_wt.active = false;
 	g_wt.pendingReset = false;
 	g_wt.pendingAdvance = false;
 	if (aborted) {
-		if (!S("win-save")) g_windows.clear();
+		g_windows.clear();
 		showSavedBox("Test stopped: no clicks to test before the macro's death\n" + g_diag + "\n" + g_diagDeath);
 		return;
 	}
 	if (!g_selected.empty()) writeMacro(g_selected);
-	if (g_wt.baseEnd < 0x7fffffff) showSavedBox("Window test done (up to frame " + std::to_string(g_wt.baseEnd) + "), saved");
-	else showSavedBox("Window test done and saved");
+	std::string note = (S("win-save") && !g_wt.spOk) ? "\nSave points did not match here, used full replay" : "";
+	if (g_wt.baseEnd < 0x7fffffff) showSavedBox("Window test done (up to frame " + std::to_string(g_wt.baseEnd) + "), saved" + note);
+	else showSavedBox("Window test done and saved" + note);
 }
 
 // ---------- solver engine ----------
@@ -1040,7 +1116,6 @@ protected:
 	TextInput* m_input = nullptr;
 	TextInput* m_search = nullptr;
 	ScrollLayer* m_list = nullptr;
-	Scrollbar* m_scrollbar = nullptr;
 	std::vector<CCNode*> m_tabNodes;
 	float m_listW = 0.f;
 	float m_colW = 0.f;
@@ -1101,10 +1176,10 @@ protected:
 		}
 
 		m_bs = m_compact ? 0.45f : 0.55f;
-		float leftX = -pw * 0.25f;
+		float leftX = -pw * 0.23f;
 		m_rightX = pw * 0.25f;
 		m_colW = pw * 0.46f;
-		m_listW = pw * 0.40f;
+		m_listW = pw * 0.44f;
 		m_top = ph / 2.f;
 		float listH = ph - 108.f;
 		float listY = -33.f;
@@ -1131,10 +1206,6 @@ protected:
 		m_list->setAnchorPoint({ 0.5f, 0.5f });
 		m_list->m_contentLayer->setLayout(ScrollLayer::createDefaultListLayout());
 		m_mainLayer->addChildAtPosition(m_list, Anchor::Center, { leftX, listY });
-
-		// scroll bar: drag it to move through the macro list
-		m_scrollbar = Scrollbar::create(m_list);
-		m_mainLayer->addChildAtPosition(m_scrollbar, Anchor::Center, { leftX + m_listW / 2.f + 18.f, listY });
 
 		// ----- right side: shared text box (hidden on the Control tab) -----
 		m_input = TextInput::create(m_colW / 0.75f, "Name / tag / macro / range");
@@ -1173,14 +1244,12 @@ protected:
 	}
 
 	static float speedToSlider(float s) {
-		return std::sqrt(std::clamp((s - kSpeedMin) / (kSpeedMax - kSpeedMin), 0.f, 1.f));
+		return std::clamp((s - kSpeedMin) / (kSpeedMax - kSpeedMin), 0.f, 1.f);
 	}
 
 	static float sliderToSpeed(float v) {
-		v = std::clamp(v, 0.f, 1.f);
-		float s = kSpeedMin + v * v * (kSpeedMax - kSpeedMin);
-		float stepSz = s < 2.f ? 0.05f : (s < 10.f ? 0.25f : 1.f);
-		s = std::round(s / stepSz) * stepSz;
+		float s = kSpeedMin + std::clamp(v, 0.f, 1.f) * (kSpeedMax - kSpeedMin);
+		s = std::round(s * 20.f) / 20.f;
 		return std::clamp(s, kSpeedMin, kSpeedMax);
 	}
 
@@ -1269,13 +1338,11 @@ protected:
 			m_tabNodes.push_back(m_speedSlider);
 
 			float pg = 5.f;
-			float pwid = (m_colW - pg * 3.f) / 4.f;
+			float pwid = (m_colW - pg * 2.f) / 3.f;
 			float px = m_rightX - m_colW / 2.f + pwid / 2.f;
 			addCell("0.5x", menu_selector(MacroPopup::onPreset), px, rowY - 102.f, pwid, 0.45f, false)->setTag(50);
 			addCell("1x", menu_selector(MacroPopup::onPreset), px + (pwid + pg), rowY - 102.f, pwid, 0.45f, false)->setTag(100);
 			addCell("2x", menu_selector(MacroPopup::onPreset), px + (pwid + pg) * 2.f, rowY - 102.f, pwid, 0.45f, false)->setTag(200);
-			addCell("10x", menu_selector(MacroPopup::onPreset), px + (pwid + pg) * 3.f, rowY - 102.f, pwid, 0.45f, false)->setTag(1000);
-			addCell("Show hitbox", menu_selector(MacroPopup::onHitbox), m_rightX, rowY - 128.f, m_colW, 0.45f, S("hb-show") != 0);
 		} else if (m_tab == 1) {
 			// Files
 			addRow({
@@ -1312,16 +1379,15 @@ protected:
 				{ "Del range", menu_selector(MacroPopup::onDelRange) },
 			}, rowY);
 			addRow({
-				{ "Test win", menu_selector(MacroPopup::onTestWindow) },
+				{ "Test windows", menu_selector(MacroPopup::onTestWindow) },
 				{ "Stop test", menu_selector(MacroPopup::onStopTest) },
-				{ "Clear win", menu_selector(MacroPopup::onClearWin) },
 			}, rowY - step);
 			addRow({
 				{ "Auto solve", menu_selector(MacroPopup::onSolve) },
 				{ "Stop solve", menu_selector(MacroPopup::onStopSolve) },
 			}, rowY - step * 2.f);
 			tabLabel("Merge: type macro to append. Del range: 100-500", rowY - step * 3.f + 6.f, 0.28f);
-			tabLabel("Test win: saves after each click, then resumes", rowY - step * 3.f - 8.f, 0.28f);
+			tabLabel("Test windows: finds each click's frame window", rowY - step * 3.f - 8.f, 0.28f);
 			tabLabel("Auto solve: finds clicks, replaces loaded macro", rowY - step * 3.f - 22.f, 0.28f);
 		}
 	}
@@ -1765,13 +1831,15 @@ protected:
 			if (g_inputs[i].down) g_wt.clicks.push_back(static_cast<int>(i));
 		}
 		if (g_wt.clicks.empty()) return notify("Macro has no clicks");
-		if (!S("win-save")) g_windows.clear();
-		else if (!g_windows.empty()) notify("Resuming from the last save point");
+		g_windows.clear();
 		g_wt.active = true;
 		g_wt.phase = 0;
 		g_cursor = 0;
 		g_anchorCursor = 0;
 		g_mode = 3;
+		g_spStrategy = 0;
+		spClear();
+		wtBeginSpeed();
 		notify("Window test: restart the level");
 		this->keyBackClicked();
 	}
@@ -1779,10 +1847,11 @@ protected:
 	void onStopTest(CCObject*) {
 		if (g_mode != 3) return notify("No test running");
 		g_mode = 0;
+		wtRestoreSpeed();
+		spClear();
 		g_wt.active = false;
 		g_wt.pendingReset = false;
 		g_wt.pendingAdvance = false;
-		if (S("win-save") && !g_selected.empty() && !g_windows.empty()) writeMacro(g_selected);
 		notify("Window test stopped");
 		refreshLabels();
 	}
@@ -1799,19 +1868,6 @@ protected:
 		applySpeed();
 		if (m_speedSlider) m_speedSlider->setValue(speedToSlider(g_speed));
 		refreshLabels();
-	}
-
-	void onHitbox(CCObject*) {
-		setInt("hb-show", S("hb-show") ? 0 : 1);
-		notify(S("hb-show") ? "Hitboxes on" : "Hitboxes off");
-		buildTab();
-		refreshLabels();
-	}
-
-	void onClearWin(CCObject*) {
-		g_windows.clear();
-		if (!g_selected.empty() && !g_inputs.empty()) writeMacro(g_selected);
-		notify("Window data cleared");
 	}
 
 	void onSettings(CCObject*);
@@ -1961,18 +2017,6 @@ protected:
 			m_preview->removeFromParent();
 			m_preview = nullptr;
 		}
-		if (m_page >= 13 && m_page <= 16) {
-			static char const* const pre[] = { "hb-p", "hb-h", "hb-s", "hb-x" };
-			std::string p = pre[m_page - 13];
-			ccColor3B hc = {
-				static_cast<GLubyte>(val((p + "r").c_str())),
-				static_cast<GLubyte>(val((p + "g").c_str())),
-				static_cast<GLubyte>(val((p + "b").c_str()))
-			};
-			m_preview = makePanel(0, hc, { 60.f, 46.f });
-			m_mainLayer->addChildAtPosition(m_preview, Anchor::Center, { 135.f, 20.f });
-			return;
-		}
 		if (m_page > 2) return;
 		ccColor3B c;
 		int ci = val("ui-color");
@@ -2096,28 +2140,6 @@ void MacroPopup::onSettings(CCObject*) {
 	if (auto popup = SettingsPopup::create()) popup->show();
 }
 
-// ---------- hitboxes ----------
-
-static ccColor3B hbColor(char const* prefix) {
-	std::string p(prefix);
-	return {
-		static_cast<GLubyte>(S((p + "r").c_str())),
-		static_cast<GLubyte>(S((p + "g").c_str())),
-		static_cast<GLubyte>(S((p + "b").c_str()))
-	};
-}
-
-static void hbRect(CCDrawNode* node, CCRect const& r, ccColor3B c, float fillAlpha, float width) {
-	CCPoint v[4] = {
-		{ r.getMinX(), r.getMinY() }, { r.getMaxX(), r.getMinY() },
-		{ r.getMaxX(), r.getMaxY() }, { r.getMinX(), r.getMaxY() }
-	};
-	float fr = c.r / 255.f, fg = c.g / 255.f, fb = c.b / 255.f;
-	node->drawPolygon(v, 4,
-		ccc4f(fr * fillAlpha, fg * fillAlpha, fb * fillAlpha, fillAlpha),
-		width, ccc4f(fr, fg, fb, 1.f));
-}
-
 // ---------- hooks ----------
 
 class $modify(GJBaseGameLayer) {
@@ -2128,7 +2150,6 @@ class $modify(GJBaseGameLayer) {
 		updateHud();
 		updateWindowHud();
 		updatePath();
-		updateHitboxes();
 		// window test: restart the level right after an attempt is decided
 		if (g_wt.pendingReset) {
 			g_wt.pendingReset = false;
@@ -2140,27 +2161,163 @@ class $modify(GJBaseGameLayer) {
 		}
 	}
 
+	// ----- tally + rings (window counter, tally style) -----
+	static int winBucket(int w) {
+		if (w <= 4) return std::max(0, w - 1);
+		if (w <= 6) return 4;
+		if (w <= 8) return 5;
+		return 6;
+	}
+
+	void updateTally(bool on) {
+		static const ccColor3B cols[7] = {
+			{ 240, 75, 75 }, { 250, 160, 60 }, { 250, 225, 70 }, { 255, 255, 255 },
+			{ 85, 210, 105 }, { 140, 215, 255 }, { 110, 110, 250 }
+		};
+		auto root = m_uiLayer->getChildByID("macro-tally");
+		auto rings = m_objectLayer ? static_cast<CCDrawNode*>(m_objectLayer->getChildByID("macro-rings")) : nullptr;
+		if (!on) {
+			if (root) root->setVisible(false);
+			if (rings) {
+				rings->clear();
+				rings->setVisible(false);
+			}
+			return;
+		}
+
+		bool wide = S("win-max") * 2 + 1 > 12;
+		static char const* const names[7] = { "1", "2", "3", "4", "5-6", "7-8", "9-12" };
+		if (!root) {
+			root = CCNode::create();
+			root->setID("macro-tally");
+			for (int i = 0; i < 7; i++) {
+				auto nm = CCLabelBMFont::create("", "bigFont.fnt");
+				nm->setAnchorPoint({ 0.f, 0.5f });
+				nm->setTag(100 + i);
+				nm->setColor(cols[i]);
+				root->addChild(nm);
+				auto ct = CCLabelBMFont::create("0", "bigFont.fnt");
+				ct->setAnchorPoint({ 1.f, 0.5f });
+				ct->setTag(200 + i);
+				ct->setColor(cols[i]);
+				root->addChild(ct);
+			}
+			m_uiLayer->addChild(root, 151);
+		}
+		root->setVisible(true);
+
+		// count the clicks passed so far in this run
+		if (g_cursor < g_tallyCursor) {
+			for (auto& c : g_tally) c = 0;
+			g_tallyCursor = 0;
+		}
+		while (g_tallyCursor < g_cursor && g_tallyCursor < g_inputs.size()) {
+			size_t idx = g_tallyCursor++;
+			if (!g_inputs[idx].down) continue;
+			auto it = g_windows.find(static_cast<int>(idx));
+			if (it != g_windows.end()) g_tally[winBucket(it->second.first + it->second.second + 1)]++;
+		}
+
+		auto ws = CCDirector::get()->getWinSize();
+		float sc = S("win-size") / 100.f * 0.9f;
+		float topY = ws.height * 0.8f;
+		for (int i = 0; i < 7; i++) {
+			int row = 6 - i; // biggest windows on top
+			float y = topY - row * 44.f * sc;
+			auto nm = static_cast<CCLabelBMFont*>(root->getChildByTag(100 + i));
+			auto ct = static_cast<CCLabelBMFont*>(root->getChildByTag(200 + i));
+			if (!nm || !ct) continue;
+			std::string label = std::string(i == 6 && wide ? "9+" : names[i]) + ":";
+			if (label != std::string(nm->getString())) nm->setString(label.c_str());
+			std::string count = std::to_string(g_tally[i]);
+			if (count != std::string(ct->getString())) ct->setString(count.c_str());
+			nm->setScale(sc);
+			ct->setScale(sc);
+			nm->setPosition({ 8.f, y });
+			ct->setPosition({ 8.f + 245.f * sc, y });
+			nm->setOpacity(235);
+			ct->setOpacity(235);
+		}
+
+		// rings at the next clicks, with the window size next to each
+		if (!m_objectLayer) return;
+		if (S("win-ring") == 0 || g_anchors.empty()) {
+			if (rings) {
+				rings->clear();
+				rings->setVisible(false);
+			}
+			return;
+		}
+		if (!rings) {
+			rings = CCDrawNode::create();
+			rings->setID("macro-rings");
+			for (int i = 0; i < 3; i++) {
+				auto lab = CCLabelBMFont::create("", "bigFont.fnt");
+				lab->setTag(300 + i);
+				lab->setScale(0.5f);
+				rings->addChild(lab);
+			}
+			m_objectLayer->addChild(rings, 501);
+		}
+		rings->setVisible(true);
+		rings->clear();
+		int shown = 0;
+		for (size_t i = g_cursor; i < g_inputs.size() && shown < 3; i++) {
+			auto& in = g_inputs[i];
+			if (!in.down) continue;
+			if (in.frame > g_frame + 150) break;
+			auto wit = g_windows.find(static_cast<int>(i));
+			if (wit == g_windows.end()) continue;
+			auto a = std::lower_bound(g_anchors.begin(), g_anchors.end(), in.frame,
+				[](MacroAnchor const& m, int f) { return m.frame < f; });
+			if (a == g_anchors.end()) break;
+			int w = wit->second.first + wit->second.second + 1;
+			auto col = cols[winBucket(w)];
+			ccColor4F c4 = ccc4f(col.r / 255.f, col.g / 255.f, col.b / 255.f, 0.95f);
+			float r = 14.f;
+			const int segs = 28;
+			for (int k = 0; k < segs; k++) {
+				float a0 = k * 6.2831853f / segs;
+				float a1 = (k + 1) * 6.2831853f / segs;
+				rings->drawSegment(
+					{ a->x1 + r * std::cos(a0), a->y1 + r * std::sin(a0) },
+					{ a->x1 + r * std::cos(a1), a->y1 + r * std::sin(a1) }, 1.8f, c4);
+			}
+			if (auto lab = static_cast<CCLabelBMFont*>(rings->getChildByTag(300 + shown))) {
+				lab->setVisible(true);
+				lab->setString(std::to_string(w).c_str());
+				lab->setColor(col);
+				lab->setPosition({ a->x1 - r - 12.f, a->y1 });
+			}
+			shown++;
+		}
+		for (int k = shown; k < 3; k++) {
+			if (auto lab = rings->getChildByTag(300 + k)) lab->setVisible(false);
+		}
+	}
+
 	// ----- frame window counter -----
 	// Shows the fixed window (in frames) of the next click while playing.
 	void updateWindowHud() {
 		if (!m_uiLayer || !PlayLayer::get()) return;
 		auto label = static_cast<CCLabelBMFont*>(m_uiLayer->getChildByID("macro-wnd"));
+		updateTally(g_mode == 2 && S("win-hud") != 0 && !g_windows.empty() && S("win-style") == 1);
 		std::string text;
 		char buf[96];
 		if (g_mode == 3 && g_wt.active) {
 			if (g_wt.phase == 0) {
 				std::snprintf(buf, sizeof(buf), "Window test: checking macro");
 			} else {
-				std::snprintf(buf, sizeof(buf), "Testing click %d/%d  shift %c%d",
+				std::snprintf(buf, sizeof(buf), "Testing click %d/%d  shift %c%d%s",
 					static_cast<int>(g_wt.ci) + 1, static_cast<int>(g_wt.clicks.size()),
-					g_wt.phase == 1 ? '-' : '+', g_wt.s);
+					g_wt.phase == 1 ? '-' : '+', g_wt.s, g_wt.sp >= 0 ? "  (save point)" : "");
 			}
 			text = buf;
 		} else if (g_mode == 4 && g_sol.active) {
 			std::snprintf(buf, sizeof(buf), "Solving  frame %d  tries %d  option %d/%d",
 				g_sol.frame, g_sol.attempts, g_sol.k + 1, kSolCands);
 			text = buf;
-		} else if (g_mode == 2 && S("win-hud") && !g_windows.empty()) {
+		} else if (g_mode == 2 && S("win-hud") && !g_windows.empty() && S("win-style") == 0) {
 			for (size_t i = g_cursor; i < g_inputs.size(); i++) {
 				if (!g_inputs[i].down) continue;
 				auto it = g_windows.find(static_cast<int>(i));
@@ -2259,66 +2416,6 @@ class $modify(GJBaseGameLayer) {
 		float x = left ? 6.f : ws.width - sz.width - 6.f;
 		float y = topSide ? ws.height - 6.f : sz.height + 6.f;
 		root->setPosition({ x, y });
-	}
-
-	// ----- hitboxes -----
-	// Own overlay with your own colours. Objects are drawn as their
-	// axis-aligned bounding box.
-	void updateHitboxes() {
-		if (!m_objectLayer || !PlayLayer::get()) return;
-		auto node = static_cast<CCDrawNode*>(m_objectLayer->getChildByID("macro-hb"));
-		if (!S("hb-show")) {
-			if (node) node->removeFromParent();
-			return;
-		}
-		if (!node) {
-			node = CCDrawNode::create();
-			node->setID("macro-hb");
-			m_objectLayer->addChild(node, 1000);
-		}
-		node->clear();
-
-		float fill = S("hb-fill") / 100.f;
-		float w = static_cast<float>(S("hb-width")) * 0.5f;
-		float range = static_cast<float>(S("hb-range"));
-		auto cPlayer = hbColor("hb-p");
-		auto cHazard = hbColor("hb-h");
-		auto cSolid = hbColor("hb-s");
-		auto cSpecial = hbColor("hb-x");
-		bool inner = S("hb-inner") != 0;
-		bool showHz = S("hb-hz") != 0;
-		bool showSo = S("hb-sol") != 0;
-		bool showSp = S("hb-spc") != 0;
-
-		PlayerObject* players[2] = { m_player1, (m_gameState.m_isDualMode ? m_player2 : nullptr) };
-		for (auto p : players) {
-			if (!p) continue;
-			CCRect r = p->getObjectRect();
-			hbRect(node, r, cPlayer, fill, w);
-			if (inner) {
-				float hw = r.size.width * 0.15f;
-				float hh = r.size.height * 0.15f;
-				CCRect in(r.getMidX() - hw, r.getMidY() - hh, hw * 2.f, hh * 2.f);
-				hbRect(node, in, cPlayer, fill, w);
-			}
-		}
-
-		if (!(showHz || showSo || showSp) || !m_objects || !m_player1) return;
-		float px = m_player1->getPositionX();
-		for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
-			if (!obj) continue;
-			float ox = obj->getPositionX();
-			if (ox < px - range * 0.5f || ox > px + range) continue;
-			auto t = obj->m_objectType;
-			if (t == GameObjectType::Decoration || t == GameObjectType::Modifier) continue;
-			if (t == GameObjectType::Hazard) {
-				if (showHz) hbRect(node, obj->getObjectRect(), cHazard, fill, w);
-			} else if (t == GameObjectType::Solid || t == GameObjectType::Slope) {
-				if (showSo) hbRect(node, obj->getObjectRect(), cSolid, fill, w);
-			} else if (showSp) {
-				hbRect(node, obj->getObjectRect(), cSpecial, fill, w);
-			}
-		}
 	}
 
 	// ----- pathfinder overlay -----
@@ -2453,6 +2550,26 @@ class $modify(GJBaseGameLayer) {
 
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		int frame = static_cast<int>(m_gameState.m_currentProgress);
+		if (g_mode == 3) {
+			if (g_spNeedBase) {
+				g_spNeedBase = false;
+				g_frameBase = g_spExpect - frame;
+				if (g_spStrategy == 1) {
+					// the save point may not remember a held button: press it again if the macro holds it here
+					bool held = false;
+					for (size_t k = g_cursor; k > 0 && k <= g_work.size(); k--) {
+						auto& in = g_work[k - 1];
+						if (in.p1 && in.button == 1) { held = in.down; break; }
+					}
+					if (held) {
+						g_injecting = true;
+						GJBaseGameLayer::handleButton(true, 1, true);
+						g_injecting = false;
+					}
+				}
+			}
+			frame += g_frameBase;
+		}
 		g_frame = frame;
 		if (g_diagPending && m_player1) {
 			g_diagPending = false;
@@ -2465,6 +2582,30 @@ class $modify(GJBaseGameLayer) {
 				auto& a = g_anchors.front();
 				std::snprintf(b, sizeof(b), "\nrecorded: x %.1f y %.1f vy %.2f frame %d", a.x1, a.y1, a.v1, a.frame);
 				g_diag += b;
+			}
+		}
+		if (g_mode == 3 && g_wt.active && m_player1) {
+			float px = static_cast<float>(m_player1->getPositionX());
+			float py = static_cast<float>(m_player1->getPositionY());
+			if (g_wt.phase == 0 && !g_wt.resolved && frame >= 0 && frame < 600000) {
+				if (g_baseTrace.size() <= static_cast<size_t>(frame)) g_baseTrace.resize(static_cast<size_t>(frame) + 1, { 1e9f, 1e9f });
+				g_baseTrace[frame] = { px, py };
+				if (g_wt.spOk && S("win-save") && frame > 0 && g_sps.size() < 150 && frame % S("win-gap") == 0) {
+					auto pl = PlayLayer::get();
+					if (pl && pl->m_isPracticeMode) {
+						if (auto cp = spCreate(pl)) {
+							cp->retain();
+							g_sps.push_back({ frame, cp });
+						}
+					}
+				}
+			}
+			if (g_spVerify > 0 && !g_wt.resolved) {
+				g_spVerify--;
+				if (frame >= 0 && static_cast<size_t>(frame) < g_baseTrace.size()) {
+					auto& tr = g_baseTrace[frame];
+					if (tr[0] < 1e8f && (std::fabs(px - tr[0]) > 0.05f || std::fabs(py - tr[1]) > 0.05f)) spFail();
+				}
 			}
 		}
 		if (g_mode == 1) {
@@ -2534,6 +2675,9 @@ class $modify(PlayLayer) {
 		g_corrections = 0;
 		g_pathDirty = true;
 		g_diagPending = (g_mode == 3 || g_mode == 4);
+		g_frameBase = 0;
+		g_spNeedBase = false;
+		g_spVerify = 0;
 		enforceSpeed(m_gameState.m_timeWarp);
 
 		if (g_mode == 3 && g_wt.active) {
@@ -2545,7 +2689,26 @@ class $modify(PlayLayer) {
 					return;
 				}
 			}
+			if (g_wt.phase == 0) spClear();
 			wtBuildWork();
+			g_wt.sp = -1;
+			if (g_wt.phase > 0 && g_wt.spOk && S("win-save") && m_isPracticeMode && !g_sps.empty()) {
+				size_t ci = static_cast<size_t>(g_wt.clicks[g_wt.ci]);
+				if (ci < g_inputs.size()) {
+					int need = g_inputs[ci].frame - S("win-max") - 3;
+					int best = -1;
+					for (size_t i = 0; i < g_sps.size(); i++) {
+						if (g_sps[i].frame <= need) best = static_cast<int>(i);
+					}
+					if (best >= 0 && spLoad(this, g_sps[best].cp)) {
+						g_wt.sp = best;
+						g_spNeedBase = true;
+						g_spExpect = g_sps[best].frame;
+						g_spVerify = 10;
+						while (g_cursor < g_work.size() && g_work[g_cursor].frame < g_spExpect) g_cursor++;
+					}
+				}
+			}
 			g_wt.resolved = false;
 		}
 
@@ -2588,6 +2751,10 @@ class $modify(PlayLayer) {
 		}
 		if (g_mode == 3 && g_wt.active && !g_wt.resolved) {
 			this->stopActionByTag(0x10); // cancel GD's slow delayed restart
+			if (g_spVerify > 0) {
+				spFail();
+				return;
+			}
 			if (g_wt.phase == 0) {
 				// the macro dies here on its own: that is the latest point we can judge
 				g_wt.baseEnd = g_frame;
@@ -2647,8 +2814,9 @@ class $modify(PlayLayer) {
 
 	void onQuit() {
 		if (g_mode == 3) {
-			if (S("win-save") && !g_selected.empty() && !g_windows.empty()) writeMacro(g_selected);
 			g_mode = 0;
+			wtRestoreSpeed();
+			spClear();
 			g_wt.active = false;
 			g_wt.pendingReset = false;
 			g_wt.pendingAdvance = false;
@@ -2671,22 +2839,14 @@ class $modify(MacroPause, PauseLayer) {
 		PauseLayer::customSetup();
 		auto ws = CCDirector::get()->getWinSize();
 		int corner = std::clamp(S("pause-corner"), 0, 3);
-		float x = (corner == 1 || corner == 3) ? 60.f : ws.width - 135.f;
+		float x = (corner == 1 || corner == 3) ? 60.f : ws.width - 60.f;
 		float y = (corner >= 2) ? ws.height - 40.f : 40.f;
 
 		auto menu = CCMenu::create();
-		auto btn = makeButton("Macro", this, menu_selector(MacroPause::onOpenMacro), 0.5f);
+		auto btn = makeButton("Macro", this, menu_selector(MacroPause::onOpenMacro), 1.f);
 		menu->addChild(btn);
-		auto hbBtn = makeButton("Hitbox", this, menu_selector(MacroPause::onToggleHitbox), 0.5f);
-		hbBtn->setPosition({ 0.f, corner >= 2 ? -24.f : 24.f });
-		menu->addChild(hbBtn);
 		menu->setPosition(x, y);
 		this->addChild(menu);
-	}
-
-	void onToggleHitbox(CCObject*) {
-		setInt("hb-show", S("hb-show") ? 0 : 1);
-		Notification::create(S("hb-show") ? "Hitboxes on" : "Hitboxes off")->show();
 	}
 
 	void onOpenMacro(CCObject*) {

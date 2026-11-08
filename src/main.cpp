@@ -15,20 +15,28 @@ static bool g_injecting = false;
 class $modify(GJBaseGameLayer) {
 	void handleButton(bool down, int button, bool p1) {
 		if (g_mode == 2 && !g_injecting) return;
-		if (g_mode == 1) g_inputs.push_back({ m_gameState.m_currentProgress, button, down, p1 });
+		if (g_mode == 1) {
+			MacroInput in;
+			in.frame = static_cast<int>(m_gameState.m_currentProgress);
+			in.button = static_cast<int>(button);
+			in.down = down;
+			in.p1 = p1;
+			g_inputs.push_back(in);
+		}
 		GJBaseGameLayer::handleButton(down, button, p1);
 	}
 
-		void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		if (g_mode == 2) {
-			while (g_cursor < g_inputs.size() && g_inputs[g_cursor].frame <= m_gameState.m_currentProgress) {
+			int frame = static_cast<int>(m_gameState.m_currentProgress);
+			while (g_cursor < g_inputs.size() && g_inputs[g_cursor].frame <= frame) {
 				auto& i = g_inputs[g_cursor++];
 				g_injecting = true;
-				GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+				GJBaseGameLayer::handleButton(i.down, i.button, i.p1);
 				g_injecting = false;
 			}
 		}
-		GJBaseGameLayer::processCommands(dt);
+		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 	}
 };
 

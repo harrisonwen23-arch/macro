@@ -48,6 +48,29 @@ static std::string g_folder; // "" = all, "(none)" = untagged
 static bool g_pathDirty = true;
 static size_t g_pathKey = static_cast<size_t>(-1);
 
+// ---------- frame windows ----------
+// For every click (input index) the number of frames it can be pressed
+// earlier / later and still survive. Saved in the macro file as "W" lines.
+using WinMap = std::map<int, std::pair<int, int>>;
+static WinMap g_windows;
+
+struct WinTest {
+	bool active = false;
+	std::vector<int> clicks; // indices into g_inputs of every press
+	size_t ci = 0;
+	int phase = 0;           // 0 = check macro, 1 = test early, 2 = test late
+	int s = 0;               // current shift in frames
+	int early = 0;
+	int late = 0;
+	int endFrame = 0x7fffffff;
+	bool resolved = false;   // result of the current attempt already recorded
+	bool lastOk = false;
+	bool pendingReset = false;
+	bool pendingAdvance = false;
+};
+static WinTest g_wt;
+static std::vector<MacroInput> g_work; // macro with the tested click shifted
+
 static constexpr float kSpeedMin = 0.1f;
 static constexpr float kSpeedMax = 5.f;
 
@@ -153,12 +176,17 @@ static const SettingDef kSettings[] = {
 	{ "pf-width", "Line width", 1, 4, 1, 2, nullptr, 1, "" },
 	{ "pf-dots", "Anchor dots", 0, 1, 1, 0, kOffOn, 1, "" },
 	{ "pf-ahead", "Route ahead", 0, 3, 1, 1, kAheadNames, 1, "" },
+	// page 9: frame window counter
+	{ "win-hud", "Window counter", 0, 1, 1, 1, kOffOn, 1, "" },
+	{ "win-size", "Counter size", 50, 100, 10, 70, nullptr, 1, "%" },
+	{ "win-max", "Test range", 1, 10, 1, 6, nullptr, 1, "f" },
+	{ "win-after", "Test survive", 10, 120, 10, 40, nullptr, 1, "f" },
 };
-static const int kSettingCount = 36;
+static const int kSettingCount = 40;
 static const int kRowsPerPage = 4;
-static const int kPageCount = 9;
+static const int kPageCount = 10;
 static char const* const kPageTitles[] = {
-	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder"
+	"Look", "Colours", "Gradient", "Background", "Layout", "HUD", "Recording", "Playback", "Pathfinder", "Window"
 };
 
 struct ThemeVal { char const* key; int val; };
@@ -293,6 +321,7 @@ static std::vector<std::string> listMacros() {
 //   T <epoch>                                                  -> saved time
 //   <frame> <button> <down 0/1> <p1 0/1>                      -> input
 //   A <frame> <x1> <y1> <v1> <dual 0/1> <x2> <y2> <v2>        -> anchor
+//   W <input index> <early frames> <late frames>              -> click window
 static void serializeMacro(std::ostream& out) {
 	out << std::setprecision(9);
 	out << "T " << static_cast<long long>(std::time(nullptr)) << '\n';
@@ -303,15 +332,23 @@ static void serializeMacro(std::ostream& out) {
 		out << "A " << a.frame << ' ' << a.x1 << ' ' << a.y1 << ' ' << a.v1 << ' '
 			<< (a.dual ? 1 : 0) << ' ' << a.x2 << ' ' << a.y2 << ' ' << a.v2 << '\n';
 	}
+	for (auto& [idx, w] : g_windows) {
+		out << "W " << idx << ' ' << w.first << ' ' << w.second << '\n';
+	}
 }
 
-static void parseMacro(std::istream& in, std::vector<MacroInput>& inputs, std::vector<MacroAnchor>& anchors) {
+static void parseMacro(std::istream& in, std::vector<MacroInput>& inputs, std::vector<MacroAnchor>& anchors, WinMap* wins = nullptr) {
 	inputs.clear();
 	anchors.clear();
+	if (wins) wins->clear();
 	std::string line;
 	while (std::getline(in, line)) {
 		if (line.empty() || line[0] == 'T') continue;
-		if (line[0] == 'A') {
+		if (line[0] == 'W') {
+			std::istringstream s(line.substr(1));
+			int idx, e, l;
+			if (wins && (s >> idx >> e >> l)) (*wins)[idx] = { e, l };
+		} else if (line[0] == 'A') {
 			std::istringstream s(line.substr(1));
 			MacroAnchor a{};
 			int dual = 0;
@@ -336,10 +373,10 @@ static bool writeMacro(std::string const& name) {
 	return true;
 }
 
-static bool readMacro(std::string const& name, std::vector<MacroInput>& inputs, std::vector<MacroAnchor>& anchors) {
+static bool readMacro(std::string const& name, std::vector<MacroInput>& inputs, std::vector<MacroAnchor>& anchors, WinMap* wins = nullptr) {
 	std::ifstream in(macroFile(name));
 	if (!in) return false;
-	parseMacro(in, inputs, anchors);
+	parseMacro(in, inputs, anchors, wins);
 	return true;
 }
 
@@ -479,6 +516,87 @@ static void showSavedBox(std::string const& text) {
 	));
 
 	scene->addChild(node, 10000);
+}
+
+// ---------- window test engine ----------
+
+static void wtResolve(bool ok) {
+	if (!g_wt.active || g_wt.resolved) return;
+	g_wt.resolved = true;
+	g_wt.lastOk = ok;
+	g_wt.pendingReset = true;
+	g_wt.pendingAdvance = true;
+}
+
+// Builds the macro for the current attempt: the tested click (and its
+// release) is moved by the current shift.
+static void wtBuildWork() {
+	g_work = g_inputs;
+	if (g_wt.phase == 0) {
+		g_wt.endFrame = 0x7fffffff;
+		return;
+	}
+	int shift = g_wt.phase == 1 ? -g_wt.s : g_wt.s;
+	size_t idx = static_cast<size_t>(g_wt.clicks[g_wt.ci]);
+	if (idx >= g_work.size()) return;
+	int button = g_work[idx].button;
+	bool p1 = g_work[idx].p1;
+	g_work[idx].frame = std::max(0, g_work[idx].frame + shift);
+	int clickFrame = g_work[idx].frame;
+	for (size_t j = idx + 1; j < g_work.size(); j++) {
+		if (g_work[j].button == button && g_work[j].p1 == p1 && !g_work[j].down) {
+			g_work[j].frame = std::max(0, g_work[j].frame + shift);
+			break;
+		}
+	}
+	std::stable_sort(g_work.begin(), g_work.end(), [](MacroInput const& a, MacroInput const& b) {
+		return a.frame < b.frame;
+	});
+	g_wt.endFrame = clickFrame + S("win-after");
+}
+
+// 1 = keep testing, 0 = finished, -1 = macro does not finish on its own
+static int wtAdvance() {
+	int maxS = S("win-max");
+	if (g_wt.phase == 0) {
+		if (!g_wt.lastOk) return -1;
+		g_wt.phase = 1;
+		g_wt.s = 1;
+		g_wt.early = 0;
+		g_wt.late = 0;
+		return 1;
+	}
+	if (g_wt.phase == 1) {
+		if (g_wt.lastOk) g_wt.early = g_wt.s;
+		if (g_wt.lastOk && g_wt.s < maxS) { g_wt.s++; return 1; }
+		g_wt.phase = 2;
+		g_wt.s = 1;
+		return 1;
+	}
+	if (g_wt.lastOk) g_wt.late = g_wt.s;
+	if (g_wt.lastOk && g_wt.s < maxS) { g_wt.s++; return 1; }
+	g_windows[g_wt.clicks[g_wt.ci]] = { g_wt.early, g_wt.late };
+	g_wt.ci++;
+	if (g_wt.ci >= g_wt.clicks.size()) return 0;
+	g_wt.phase = 1;
+	g_wt.s = 1;
+	g_wt.early = 0;
+	g_wt.late = 0;
+	return 1;
+}
+
+static void wtFinish(bool aborted) {
+	g_mode = 0;
+	g_wt.active = false;
+	g_wt.pendingReset = false;
+	g_wt.pendingAdvance = false;
+	if (aborted) {
+		g_windows.clear();
+		showSavedBox("Test stopped: macro doesn't finish the level on its own");
+		return;
+	}
+	if (!g_selected.empty()) writeMacro(g_selected);
+	showSavedBox("Window test done and saved");
 }
 
 // ---------- animated background ----------
@@ -924,9 +1042,13 @@ protected:
 				{ "Merge", menu_selector(MacroPopup::onMerge) },
 				{ "Del range", menu_selector(MacroPopup::onDelRange) },
 			}, rowY);
-			tabLabel("Merge: type the macro to append", rowY - step + 6.f, 0.3f);
-			tabLabel("Del range: type frames like 100-500", rowY - step - 8.f, 0.3f);
-			tabLabel("Tap Save (Files tab) to keep edits", rowY - step - 22.f, 0.3f);
+			addRow({
+				{ "Test windows", menu_selector(MacroPopup::onTestWindow) },
+				{ "Stop test", menu_selector(MacroPopup::onStopTest) },
+			}, rowY - step);
+			tabLabel("Merge: type the macro to append", rowY - step * 2.f + 6.f, 0.3f);
+			tabLabel("Del range: type frames like 100-500", rowY - step * 2.f - 8.f, 0.3f);
+			tabLabel("Test windows: finds each click's frame window", rowY - step * 2.f - 22.f, 0.3f);
 		}
 	}
 
@@ -1063,9 +1185,11 @@ protected:
 		g_selected = static_cast<CCNode*>(sender)->getID();
 		std::vector<MacroInput> loadedInputs;
 		std::vector<MacroAnchor> loadedAnchors;
-		if (readMacro(g_selected, loadedInputs, loadedAnchors)) {
+		WinMap loadedWins;
+		if (readMacro(g_selected, loadedInputs, loadedAnchors, &loadedWins)) {
 			g_inputs = loadedInputs;
 			g_anchors = loadedAnchors;
+			g_windows = loadedWins;
 		}
 		if (m_input) m_input->setString(g_selected);
 		rebuildList();
@@ -1076,6 +1200,7 @@ protected:
 		g_selected = nextMacroName();
 		g_inputs.clear();
 		g_anchors.clear();
+		g_windows.clear();
 		writeMacro(g_selected);
 		g_mode = 1;
 		notify("Recording: restart the level");
@@ -1116,9 +1241,11 @@ protected:
 		if (g_selected.empty()) return notify("Pick a macro first");
 		std::vector<MacroInput> loadedInputs;
 		std::vector<MacroAnchor> loadedAnchors;
-		if (!readMacro(g_selected, loadedInputs, loadedAnchors)) return notify("Could not load");
+		WinMap loadedWins;
+		if (!readMacro(g_selected, loadedInputs, loadedAnchors, &loadedWins)) return notify("Could not load");
 		g_inputs = loadedInputs;
 		g_anchors = loadedAnchors;
+		g_windows = loadedWins;
 		notify(g_inputs.empty() ? "Macro is empty" : "Macro loaded");
 	}
 
@@ -1134,6 +1261,7 @@ protected:
 		g_selected.clear();
 		g_inputs.clear();
 		g_anchors.clear();
+		g_windows.clear();
 		rebuildList();
 		refreshLabels();
 		notify("Macro deleted");
@@ -1158,6 +1286,7 @@ protected:
 	void onNew(CCObject*) {
 		g_inputs.clear();
 		g_anchors.clear();
+		g_windows.clear();
 		g_selected = nextMacroName();
 		writeMacro(g_selected);
 		if (m_input) m_input->setString(g_selected);
@@ -1196,10 +1325,12 @@ protected:
 		std::istringstream ss(text);
 		std::vector<MacroInput> inputs;
 		std::vector<MacroAnchor> anchors;
-		parseMacro(ss, inputs, anchors);
+		WinMap wins;
+		parseMacro(ss, inputs, anchors, &wins);
 		if (inputs.empty()) return notify("Clipboard has no macro");
 		g_inputs = inputs;
 		g_anchors = anchors;
+		g_windows = wins;
 		g_selected = uniqueName("Imported", false);
 		if (!writeMacro(g_selected)) return notify("Import failed");
 		if (m_input) m_input->setString(g_selected);
@@ -1270,6 +1401,10 @@ protected:
 	void onUndo(CCObject*) {
 		if (g_inputs.empty()) return notify("Nothing to undo");
 		g_inputs.pop_back();
+		for (auto it = g_windows.begin(); it != g_windows.end();) {
+			if (it->first >= static_cast<int>(g_inputs.size())) it = g_windows.erase(it);
+			else ++it;
+		}
 		notify("Last input removed. Tap Save to keep it");
 	}
 
@@ -1289,6 +1424,7 @@ protected:
 		for (auto i : in2) { i.frame += offset; g_inputs.push_back(i); }
 		for (auto a : an2) { a.frame += offset; g_anchors.push_back(a); }
 
+		g_windows.clear();
 		auto name = uniqueName(g_selected + " + " + second, false);
 		if (!writeMacro(name)) return notify("Merge failed");
 		g_selected = name;
@@ -1311,9 +1447,37 @@ protected:
 			[&](MacroInput const& i) { return inRange(i.frame); }), g_inputs.end());
 		g_anchors.erase(std::remove_if(g_anchors.begin(), g_anchors.end(),
 			[&](MacroAnchor const& x) { return inRange(x.frame); }), g_anchors.end());
+		g_windows.clear();
 		char buf[48];
 		std::snprintf(buf, sizeof(buf), "Removed %d inputs. Tap Save", static_cast<int>(before - g_inputs.size()));
 		notify(buf);
+	}
+
+	void onTestWindow(CCObject*) {
+		if (g_inputs.empty()) return notify("Load a macro first");
+		g_wt = WinTest();
+		for (size_t i = 0; i < g_inputs.size(); i++) {
+			if (g_inputs[i].down) g_wt.clicks.push_back(static_cast<int>(i));
+		}
+		if (g_wt.clicks.empty()) return notify("Macro has no clicks");
+		g_windows.clear();
+		g_wt.active = true;
+		g_wt.phase = 0;
+		g_cursor = 0;
+		g_anchorCursor = 0;
+		g_mode = 3;
+		notify("Window test: restart the level");
+		this->keyBackClicked();
+	}
+
+	void onStopTest(CCObject*) {
+		if (g_mode != 3) return notify("No test running");
+		g_mode = 0;
+		g_wt.active = false;
+		g_wt.pendingReset = false;
+		g_wt.pendingAdvance = false;
+		notify("Window test stopped");
+		refreshLabels();
 	}
 
 	void onSpeedSlider(CCObject* sender) {
@@ -1562,12 +1726,13 @@ protected:
 		while (std::getline(in, tok, ',')) {
 			if (!tok.empty()) vals.push_back(std::atoi(tok.c_str()));
 		}
-		if (static_cast<int>(vals.size()) != kSettingCount) {
+		if (vals.empty() || static_cast<int>(vals.size()) > kSettingCount) {
 			Notification::create("Profile is empty")->show();
 			return;
 		}
 		for (int i = 0; i < kSettingCount; i++) {
-			m_vals[i] = std::clamp(vals[i], kSettings[i].min, kSettings[i].max);
+			int v = i < static_cast<int>(vals.size()) ? vals[i] : kSettings[i].def;
+			m_vals[i] = std::clamp(v, kSettings[i].min, kSettings[i].max);
 		}
 		buildPage();
 		Notification::create("Profile loaded. Tap Apply")->show();
@@ -1607,7 +1772,59 @@ class $modify(GJBaseGameLayer) {
 		// keep user speed alive through deaths/restarts/time-warp resets
 		enforceSpeed(m_gameState.m_timeWarp);
 		updateHud();
+		updateWindowHud();
 		updatePath();
+		// window test: restart the level right after an attempt is decided
+		if (g_wt.pendingReset) {
+			g_wt.pendingReset = false;
+			if (auto pl = PlayLayer::get()) pl->resetLevel();
+		}
+	}
+
+	// ----- frame window counter -----
+	// Shows the fixed window (in frames) of the next click while playing.
+	void updateWindowHud() {
+		if (!m_uiLayer || !PlayLayer::get()) return;
+		auto label = static_cast<CCLabelBMFont*>(m_uiLayer->getChildByID("macro-wnd"));
+		std::string text;
+		char buf[96];
+		if (g_mode == 3 && g_wt.active) {
+			if (g_wt.phase == 0) {
+				std::snprintf(buf, sizeof(buf), "Window test: checking macro");
+			} else {
+				std::snprintf(buf, sizeof(buf), "Testing click %d/%d  shift %c%d",
+					static_cast<int>(g_wt.ci) + 1, static_cast<int>(g_wt.clicks.size()),
+					g_wt.phase == 1 ? '-' : '+', g_wt.s);
+			}
+			text = buf;
+		} else if (g_mode == 2 && S("win-hud") && !g_windows.empty()) {
+			for (size_t i = g_cursor; i < g_inputs.size(); i++) {
+				if (!g_inputs[i].down) continue;
+				auto it = g_windows.find(static_cast<int>(i));
+				if (it != g_windows.end()) {
+					int e = it->second.first;
+					int l = it->second.second;
+					std::snprintf(buf, sizeof(buf), "Window: %d  (-%d / +%d)", e + l + 1, e, l);
+					text = buf;
+				}
+				break;
+			}
+		}
+		if (text.empty()) {
+			if (label) label->setVisible(false);
+			return;
+		}
+		if (!label) {
+			label = CCLabelBMFont::create("", "bigFont.fnt");
+			label->setID("macro-wnd");
+			label->setOpacity(225);
+			m_uiLayer->addChild(label, 151);
+		}
+		label->setVisible(true);
+		if (text != std::string(label->getString())) label->setString(text.c_str());
+		label->setScale(S("win-size") / 100.f * 0.8f);
+		auto ws = CCDirector::get()->getWinSize();
+		label->setPosition({ ws.width / 2.f, ws.height - 50.f });
 	}
 
 	// ----- mini HUD -----
@@ -1650,7 +1867,7 @@ class $modify(GJBaseGameLayer) {
 		auto dot = root->getChildByID("dot");
 		if (!bg || !label || !dot) return;
 
-		std::string text = g_mode == 1 ? "REC" : (g_mode == 2 ? "PLAY" : "IDLE");
+		std::string text = g_mode == 1 ? "REC" : (g_mode == 2 ? "PLAY" : (g_mode == 3 ? "TEST" : "IDLE"));
 		if (S("hud-frame")) text += "\nFrame " + std::to_string(g_frame);
 		if (S("hud-corr") && g_mode == 2) text += "\nFixes " + std::to_string(g_corrections);
 		if (S("counter") && g_mode == 1) {
@@ -1727,7 +1944,7 @@ class $modify(GJBaseGameLayer) {
 	}
 
 	void handleButton(bool down, int button, bool p1) {
-		if (g_mode == 2 && !g_injecting) return;
+		if ((g_mode == 2 || g_mode == 3) && !g_injecting) return;
 		if (g_mode == 1) {
 			MacroInput in;
 			in.frame = static_cast<int>(m_gameState.m_currentProgress);
@@ -1785,13 +2002,18 @@ class $modify(GJBaseGameLayer) {
 		if (g_mode == 1) {
 			recordAnchor(frame);
 		}
-		if (g_mode == 2) {
-			applyAnchors(frame);
-			while (g_cursor < g_inputs.size() && g_inputs[g_cursor].frame <= frame) {
-				auto& i = g_inputs[g_cursor++];
+		if (g_mode == 2 || g_mode == 3) {
+			// anchors are off while testing: the test needs the real physics
+			if (g_mode == 2) applyAnchors(frame);
+			auto& src = g_mode == 3 ? g_work : g_inputs;
+			while (g_cursor < src.size() && src[g_cursor].frame <= frame) {
+				auto i = src[g_cursor++];
 				g_injecting = true;
 				GJBaseGameLayer::handleButton(i.down, i.button, i.p1);
 				g_injecting = false;
+			}
+			if (g_mode == 3 && g_wt.active && g_wt.phase != 0 && !g_wt.resolved && frame >= g_wt.endFrame) {
+				wtResolve(true);
 			}
 		}
 		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -1807,6 +2029,7 @@ class $modify(PlayLayer) {
 		if (g_mode == 1) {
 			g_inputs.clear();
 			g_anchors.clear();
+			g_windows.clear();
 		}
 		g_cursor = 0;
 		g_anchorCursor = 0;
@@ -1814,9 +2037,34 @@ class $modify(PlayLayer) {
 		g_corrections = 0;
 		g_pathDirty = true;
 		enforceSpeed(m_gameState.m_timeWarp);
+
+		if (g_mode == 3 && g_wt.active) {
+			if (g_wt.pendingAdvance) {
+				g_wt.pendingAdvance = false;
+				int r = wtAdvance();
+				if (r != 1) {
+					wtFinish(r < 0);
+					return;
+				}
+			}
+			wtBuildWork();
+			g_wt.resolved = false;
+		}
+	}
+
+	void destroyPlayer(PlayerObject* player, GameObject* object) {
+		PlayLayer::destroyPlayer(player, object);
+		if (g_mode == 3 && g_wt.active && !g_wt.resolved) {
+			this->stopActionByTag(0x10); // cancel GD's slow delayed restart
+			wtResolve(false);
+		}
 	}
 
 	void levelComplete() {
+		if (g_mode == 3 && g_wt.active) {
+			wtResolve(true);
+			return;
+		}
 		if (g_mode == 1 && !g_inputs.empty()) {
 			if (g_selected.empty()) g_selected = nextMacroName();
 			int clicks = 0, releases = 0;
@@ -1845,6 +2093,12 @@ class $modify(PlayLayer) {
 	}
 
 	void onQuit() {
+		if (g_mode == 3) {
+			g_mode = 0;
+			g_wt.active = false;
+			g_wt.pendingReset = false;
+			g_wt.pendingAdvance = false;
+		}
 		if (!S("keep-speed")) resetSpeed();
 		g_pathKey = static_cast<size_t>(-1);
 		PlayLayer::onQuit();

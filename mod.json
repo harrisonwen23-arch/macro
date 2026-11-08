@@ -4,10 +4,10 @@
 		"win": "2.2081",
 		"android": "2.2081"
 	},
-	"id": "Harrison.simple-macro",
+	"id": "harrison.simple-macro",
 	"name": "Simple Macro",
 	"version": "v1.0.0",
-	"developer": "Harrison",
+	"developer": "harrison",
 	"description": "Record your inputs and replay them frame-perfectly.",
 	"tags": ["utility", "gameplay"]
 }

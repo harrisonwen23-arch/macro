@@ -51,6 +51,8 @@ static size_t g_pathKey = static_cast<size_t>(-1);
 // solver diagnostics: where the player last died while solving
 static int g_solDeathFrame = -1;
 static float g_solDeathX = 0.f;
+static int g_solDeathObj = -1;  // object id that killed the player
+static int g_solSteps = 0;       // physics steps survived in the current attempt
 
 // ---------- frame windows ----------
 // For every click (input index) the number of frames it can be pressed
@@ -784,11 +786,16 @@ static void solFinish(int code) {
 	if (have && code != -1 && !g_selected.empty()) writeMacro(g_selected);
 	if (code == 0) showSavedBox("Route found: " + std::to_string(g_inputs.size()) + " inputs, saved");
 	else if (code == 3) showSavedBox("Solver stopped. Partial route saved");
-	else if (code == -1) showSavedBox(
-		"No route. Last death: frame " + std::to_string(g_solDeathFrame) +
-		", x " + std::to_string(static_cast<int>(g_solDeathX)) +
-		", tries " + std::to_string(g_sol.attempts)
-	);
+	else if (code == -1) {
+		std::string msg =
+			"No route. Died after " + std::to_string(g_solSteps) + " steps" +
+			" at frame " + std::to_string(g_solDeathFrame) +
+			", x " + std::to_string(static_cast<int>(g_solDeathX)) +
+			", object " + std::to_string(g_solDeathObj) +
+			", tries " + std::to_string(g_sol.attempts);
+		if (g_solSteps <= 1) msg += ". Dies instantly here: use an earlier checkpoint";
+		showSavedBox(msg);
+	}
 	else if (code == -2) showSavedBox("Solver hit the try limit. Partial route saved");
 	else showSavedBox("Solver lost sync with the level");
 }
@@ -1669,6 +1676,8 @@ protected:
 		g_anchorCursor = 0;
 		g_solDeathFrame = -1;
 		g_solDeathX = 0.f;
+		g_solDeathObj = -1;
+		g_solSteps = 0;
 		g_mode = 4;
 		notify("Solver: restart the level");
 		this->keyBackClicked();
@@ -2285,6 +2294,7 @@ class $modify(GJBaseGameLayer) {
 				wtResolve(true);
 			}
 			if (g_mode == 4 && g_sol.active && !g_sol.resolved) {
+				g_solSteps++;
 				if (frame >= g_sol.frame + g_sol.chunk) solResolve(1);
 				else if (frame >= g_sol.frame) recordSolAnchor(frame);
 			}
@@ -2357,6 +2367,7 @@ class $modify(PlayLayer) {
 			}
 			solBuildWork();
 			g_sol.resolved = false;
+			g_solSteps = 0;
 		}
 	}
 
@@ -2377,6 +2388,7 @@ class $modify(PlayLayer) {
 			// remember where the death happened (shown if the solver gives up)
 			g_solDeathFrame = g_frame;
 			g_solDeathX = m_player1 ? m_player1->getPositionX() : 0.f;
+			g_solDeathObj = object ? static_cast<int>(object->m_objectID) : -1;
 			// dying inside the replayed part of the route means we lost sync
 			solResolve(g_frame < g_sol.frame ? 2 : 0);
 		}

@@ -45,6 +45,7 @@ static int g_lastAnchorFrame = -1;
 static int g_corrections = 0;
 static int g_frame = 0;
 static bool g_injecting = false;
+static int g_macroTps = 0; // tick rate the loaded macro was recorded at (0 = unknown)
 static float g_speed = 1.f;
 static bool g_speedTouched = false;
 static std::string g_selected;
@@ -342,6 +343,9 @@ static int S(char const* key) {
 	return i < 0 ? 0 : getSetting(i);
 }
 
+// tick rate chosen by the user (1 - 10000, any value)
+static int curTps() { return std::clamp(getInt("tps", 240), 1, 10000); }
+
 static bool anchorsOn() { return S("anchors") != 0; }
 static float anchorTol() { return S("anchor-tol") / 10.f; }
 static int anchorEvery() {
@@ -480,6 +484,7 @@ static std::vector<std::string> listMacros() {
 static void serializeMacro(std::ostream& out) {
 	out << std::setprecision(9);
 	out << "T " << static_cast<long long>(std::time(nullptr)) << '\n';
+	out << "R " << (g_macroTps > 0 ? g_macroTps : curTps()) << '\n';
 	for (auto& i : g_inputs) {
 		out << i.frame << ' ' << i.button << ' ' << (i.down ? 1 : 0) << ' ' << (i.p1 ? 1 : 0);
 		if (i.sub != 0) out << ' ' << i.sub;
@@ -498,9 +503,11 @@ static void parseMacro(std::istream& in, std::vector<MacroInput>& inputs, std::v
 	inputs.clear();
 	anchors.clear();
 	if (wins) wins->clear();
+	g_macroTps = 0;
 	std::string line;
 	while (std::getline(in, line)) {
 		if (line.empty() || line[0] == 'T') continue;
+		if (line[0] == 'R') { g_macroTps = std::atoi(line.c_str() + 1); continue; }
 		if (line[0] == 'W') {
 			std::istringstream s(line.substr(1));
 			int idx, e, l;
@@ -556,7 +563,7 @@ static MacroInfo readInfo(std::string const& name) {
 		if (line.empty()) continue;
 		if (line[0] == 'T') {
 			info.stamp = std::atoll(line.c_str() + 1);
-		} else if (line[0] != 'A') {
+		} else if (line[0] != 'A' && line[0] != 'R' && line[0] != 'W') {
 			std::istringstream s(line);
 			int frame, button, down, p1;
 			if (s >> frame >> button >> down >> p1) {
@@ -1200,6 +1207,7 @@ protected:
 	Slider* m_speedSlider = nullptr;
 	TextInput* m_input = nullptr;
 	TextInput* m_search = nullptr;
+	TextInput* m_tpsInput = nullptr;
 	ScrollLayer* m_list = nullptr;
 	std::vector<CCNode*> m_tabNodes;
 	float m_listW = 0.f;
@@ -1386,6 +1394,7 @@ protected:
 		m_selLabel = nullptr;
 		m_speedLabel = nullptr;
 		m_speedSlider = nullptr;
+		m_tpsInput = nullptr;
 
 		// tab bar
 		float gap = 4.f;
@@ -1428,6 +1437,16 @@ protected:
 			addCell("0.5x", menu_selector(MacroPopup::onPreset), px, rowY - 102.f, pwid, 0.45f, false)->setTag(50);
 			addCell("1x", menu_selector(MacroPopup::onPreset), px + (pwid + pg), rowY - 102.f, pwid, 0.45f, false)->setTag(100);
 			addCell("2x", menu_selector(MacroPopup::onPreset), px + (pwid + pg) * 2.f, rowY - 102.f, pwid, 0.45f, false)->setTag(200);
+
+			// tick rate: type any value from 1 to 10000
+			m_tpsInput = TextInput::create(m_colW * 0.55f / 0.7f, "TPS 1-10000");
+			m_tpsInput->setScale(0.7f);
+			m_tpsInput->setFilter("0123456789");
+			m_tpsInput->setMaxCharCount(5);
+			m_tpsInput->setString(std::to_string(curTps()));
+			m_mainLayer->addChildAtPosition(m_tpsInput, Anchor::Center, { m_rightX - m_colW * 0.2f, rowY - 130.f });
+			m_tabNodes.push_back(m_tpsInput);
+			addCell("Set TPS", menu_selector(MacroPopup::onSetTps), m_rightX + m_colW * 0.3f, rowY - 130.f, m_colW * 0.36f, 0.45f, false);
 		} else if (m_tab == 1) {
 			// Files
 			addRow({
@@ -1569,7 +1588,7 @@ protected:
 
 	void refreshLabels() {
 		if (m_modeLabel) {
-			// FIX: g_mode can be 3 (window test) or 4 (solver), so the table needs 5 entries
+			// g_mode can be 3 (window test) or 4 (solver), so the table needs 5 entries
 			char const* modes[] = { "Mode: Off", "Mode: Recording", "Mode: Playing", "Mode: Testing", "Mode: Solving" };
 			m_modeLabel->setString(modes[std::clamp(g_mode, 0, 4)]);
 			fitLabel(m_modeLabel, m_colW, 0.55f);
@@ -1627,6 +1646,7 @@ protected:
 		g_inputs.clear();
 		g_anchors.clear();
 		g_windows.clear();
+		g_macroTps = curTps();
 		writeMacro(g_selected);
 		g_mode = 1;
 		notify("Recording: restart the level");
@@ -1643,7 +1663,13 @@ protected:
 		g_corrections = 0;
 		g_pathDirty = true;
 		g_mode = 2;
-		notify("Playing: restart the level");
+		if (g_macroTps > 0 && g_macroTps != curTps()) {
+			char tb[96];
+			std::snprintf(tb, sizeof(tb), "Warning: macro is %d TPS, current is %d. It will desync", g_macroTps, curTps());
+			notify(tb);
+		} else {
+			notify("Playing: restart the level");
+		}
 		this->keyBackClicked();
 	}
 
@@ -1841,7 +1867,9 @@ protected:
 		if (second == g_selected) return notify("Pick a different macro");
 		std::vector<MacroInput> in2;
 		std::vector<MacroAnchor> an2;
+		int keepTps = g_macroTps;
 		if (!readMacro(second, in2, an2)) return notify("Macro not found");
+		g_macroTps = keepTps;
 
 		int offset = 0;
 		for (auto& i : g_inputs) offset = std::max(offset, i.frame);
@@ -1957,6 +1985,18 @@ protected:
 	}
 
 	void onSettings(CCObject*);
+
+	void onSetTps(CCObject*) {
+		if (!m_tpsInput) return;
+		int v = std::atoi(std::string(m_tpsInput->getString()).c_str());
+		if (v < 1) return notify("Type a TPS from 1 to 10000");
+		v = std::min(v, 10000);
+		setInt("tps", v);
+		m_tpsInput->setString(std::to_string(v));
+		char buf[48];
+		std::snprintf(buf, sizeof(buf), "TPS set to %d", v);
+		notify(buf);
+	}
 
 public:
 	~MacroPopup() {
@@ -2268,9 +2308,24 @@ static void divReset() {
 	g_divNear.clear();
 }
 
+// colour bucket for a window size (1, 2, 3, 4, 5-6, 7-8, 9+)
+static int winBucket(int w) {
+	if (w <= 4) return std::max(0, w - 1);
+	if (w <= 6) return 4;
+	if (w <= 8) return 5;
+	return 6;
+}
+
 // ---------- hooks ----------
 
 class $modify(GJBaseGameLayer) {
+	// CBF compatibility: run this hook before click-between-frames' own handleButton hook, so
+	// live clicks can be blocked during playback. If playback still drifts with CBF on, try
+	// Priority::Last instead (then replayed inputs reach the game without CBF touching them).
+	static void onModify(auto& self) {
+		(void)self.setHookPriority("GJBaseGameLayer::handleButton", Priority::First);
+	}
+
 	void update(float dt) {
 		GJBaseGameLayer::update(dt);
 		// keep user speed alive through deaths/restarts/time-warp resets
@@ -2290,13 +2345,6 @@ class $modify(GJBaseGameLayer) {
 	}
 
 	// ----- tally + rings (window counter, tally style) -----
-	static int winBucket(int w) {
-		if (w <= 4) return std::max(0, w - 1);
-		if (w <= 6) return 4;
-		if (w <= 8) return 5;
-		return 6;
-	}
-
 	void updateTally(bool on) {
 		static const ccColor3B cols[7] = {
 			{ 240, 75, 75 }, { 250, 160, 60 }, { 250, 225, 70 }, { 255, 255, 255 },
@@ -2887,166 +2935,4 @@ class $modify(PlayLayer) {
 			if (g_sol.pendingAdvance) {
 				g_sol.pendingAdvance = false;
 				int r = solAdvance();
-				if (r != 1) {
-					solFinish(r);
-					return;
-				}
-			}
-			solBuildWork();
-			g_sol.resolved = false;
-			g_solSteps = 0;
-		}
-	}
-
-	void destroyPlayer(PlayerObject* player, GameObject* object) {
-		// During Test windows / Auto solve the game's own anti-cheat spike can appear on the
-		// player and end every run on the first step. Practice mode never submits anything,
-		// so only there the spike is skipped. Normal mode is not touched.
-		if ((g_mode == 3 || g_mode == 4) && m_isPracticeMode && object && object == m_anticheatSpike) {
-			g_diagDeath = "anti-cheat spike skipped (practice mode)";
-			return;
-		}
-		PlayLayer::destroyPlayer(player, object);
-		if (g_mode == 2 && S("div-find") && !g_divReported) {
-			g_divReported = true;
-			std::string msg = "Died at frame " + std::to_string(g_frame);
-			char b[128];
-			if (g_divFrame >= 0) {
-				std::snprintf(b, sizeof(b), "\nFirst desync: frame %d, player %d, dx %.2f dy %.2f (%d frames off)",
-					g_divFrame, g_divWhich, g_divDx, g_divDy, g_divCount);
-			} else {
-				std::snprintf(b, sizeof(b), "\nNo desync before death (max offset %.3f)", g_divMax);
-			}
-			msg += b;
-			if (g_divFrame >= 0) msg += "\nInputs just before it: " + (g_divNear.empty() ? std::string("none") : g_divNear);
-			showSavedBox(msg);
-		}
-		{
-			bool fresh = (g_mode == 3) ? (g_wt.active && !g_wt.resolved) : (g_mode == 4 && g_sol.active && !g_sol.resolved);
-			if (fresh && m_player1) {
-				char b[200];
-				std::snprintf(b, sizeof(b), "died (%s): x %.1f y %.1f, object %d at x %.1f y %.1f",
-					(object && object == m_anticheatSpike) ? "anti-cheat" : "level object",
-					static_cast<float>(m_player1->getPositionX()), static_cast<float>(m_player1->getPositionY()),
-					object ? static_cast<int>(object->m_objectID) : -1,
-					object ? static_cast<float>(object->getPositionX()) : 0.f,
-					object ? static_cast<float>(object->getPositionY()) : 0.f);
-				g_diagDeath = b;
-			}
-		}
-		if (g_mode == 3 && g_wt.active && !g_wt.resolved) {
-			this->stopActionByTag(0x10); // cancel GD's slow delayed restart
-			if (g_spVerify > 0) {
-				spFail();
-				return;
-			}
-			if (g_wt.phase == 0) {
-				// the macro dies here on its own: that is the latest point we can judge
-				g_wt.baseEnd = g_frame;
-				wtResolve(true);
-			} else {
-				wtResolve(false);
-			}
-		}
-		if (g_mode == 4 && g_sol.active && !g_sol.resolved) {
-			this->stopActionByTag(0x10);
-			// remember where the death happened (shown if the solver gives up)
-			g_solDeathFrame = g_frame;
-			g_solDeathX = m_player1 ? m_player1->getPositionX() : 0.f;
-			g_solDeathObj = object ? static_cast<int>(object->m_objectID) : -1;
-			// dying inside the replayed part of the route means we lost sync
-			solResolve(g_frame < g_sol.frame ? 2 : 0);
-		}
-	}
-
-	void levelComplete() {
-		if (g_mode == 3 && g_wt.active) {
-			wtResolve(true);
-			return;
-		}
-		if (g_mode == 4 && g_sol.active) {
-			if (!g_sol.resolved || g_sol.result == 1) solCommit();
-			solFinish(0);
-			PlayLayer::levelComplete();
-			return;
-		}
-		if (g_mode == 1 && !g_inputs.empty()) {
-			if (g_selected.empty()) g_selected = nextMacroName();
-			int clicks = 0, releases = 0;
-			for (auto& i : g_inputs) {
-				if (i.down) clicks++;
-				else releases++;
-			}
-			if (writeMacro(g_selected)) {
-				showSavedBox("Macro saved (" + std::to_string(clicks) + " clicks / " + std::to_string(releases) + " releases)");
-			}
-			g_mode = 0;
-		} else if (g_mode == 2) {
-			if (S("loop")) {
-				g_cursor = 0;
-				g_anchorCursor = 0;
-				g_corrections = 0;
-				this->resetLevel();
-				return;
-			}
-			if (g_corrections > 0 || g_divFrame >= 0) {
-				std::string m = "Playback done (" + std::to_string(g_corrections) + " corrections)";
-				if (S("div-find")) {
-					char b[128];
-					if (g_divFrame >= 0) {
-						std::snprintf(b, sizeof(b), "\nFirst desync: frame %d, dx %.2f dy %.2f (%d frames off)",
-							g_divFrame, g_divDx, g_divDy, g_divCount);
-					} else {
-						std::snprintf(b, sizeof(b), "\nNo desync found (max offset %.3f)", g_divMax);
-					}
-					m += b;
-					if (g_divFrame >= 0) m += "\nInputs just before it: " + (g_divNear.empty() ? std::string("none") : g_divNear);
-				}
-				showSavedBox(m);
-			}
-			g_mode = 0;
-		}
-		PlayLayer::levelComplete();
-	}
-
-	void onQuit() {
-		if (g_mode == 3) {
-			g_mode = 0;
-			wtRestoreSpeed();
-			spClear();
-			g_wt.active = false;
-			g_wt.pendingReset = false;
-			g_wt.pendingAdvance = false;
-		}
-		if (g_mode == 4) {
-			g_mode = 0;
-			g_sol.active = false;
-			g_sol.pendingReset = false;
-			g_sol.pendingAdvance = false;
-			solRestoreSpeed();
-		}
-		if (!S("keep-speed")) resetSpeed();
-		g_pathKey = static_cast<size_t>(-1);
-		PlayLayer::onQuit();
-	}
-};
-
-class $modify(MacroPause, PauseLayer) {
-	void customSetup() {
-		PauseLayer::customSetup();
-		auto ws = CCDirector::get()->getWinSize();
-		int corner = std::clamp(S("pause-corner"), 0, 3);
-		float x = (corner == 1 || corner == 3) ? 60.f : ws.width - 60.f;
-		float y = (corner >= 2) ? ws.height - 40.f : 40.f;
-
-		auto menu = CCMenu::create();
-		auto btn = makeButton("Macro", this, menu_selector(MacroPause::onOpenMacro), 1.f);
-		menu->addChild(btn);
-		menu->setPosition(x, y);
-		this->addChild(menu);
-	}
-
-	void onOpenMacro(CCObject*) {
-		if (auto popup = MacroPopup::create()) popup->show();
-	}
-};
+				

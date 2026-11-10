@@ -11,3 +11,8 @@
 	"description": "Record your inputs and replay them frame-perfectly.",
 	"tags": ["utility", "gameplay"]
 }
+"settings": {
+  "enabled": { "type": "bool", "default": true, "name": "Show window overlay" },
+  "wide-threshold": { "type": "int", "default": 8, "min": 2, "max": 60, "name": "Green at (frames)" },
+  "tight-threshold": { "type": "int", "default": 3, "min": 1, "max": 30, "name": "Yellow at (frames)" }
+}
